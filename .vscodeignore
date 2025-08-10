@@ -1,0 +1,11 @@
+**/.vscode/**
+**/.git/**
+
+# dev artifacts
+node_modules/**
+!node_modules/@vscode/**        # שומר תלותים הכרחיים של vsce
+dist/**/*.map
+src/**                          # רק dist נדרש לחבילה
+webview/**                      # נוסיף bundle בעתיד; כרגע לא נארוז קבצי מקור
+tsconfig.json
+pnpm-lock.yaml

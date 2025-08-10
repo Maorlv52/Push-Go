@@ -1,0 +1,66 @@
+{
+  "name": "push-and-go",
+  "displayName": "Push&Go",
+  "description": "WebStorm-like Git sidebar for fast Commit / Push / Commit+Push.",
+  "version": "0.0.1",
+  "publisher": "MaorLv52",
+  "license": "MIT",
+  "engines": { "vscode": "^1.102.0" },
+  "categories": ["SCM Providers", "Other"],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onView:pushGo.sidebar",
+    "onCommand:pushGo.open",
+    "onCommand:pushGo.commit",
+    "onCommand:pushGo.commitPush"
+  ],
+  "extensionDependencies": [
+    "vscode.git"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        { "id": "pushGo", "title": "Push&Go", "icon": "media/pushgo.svg" }
+      ]
+    },
+    "views": {
+      "pushGo": [
+        { "type": "webview", "id": "pushGo.sidebar", "name": "Push&Go", "icon": "media/pushgo.svg" }
+      ]
+    },
+    "commands": [
+      { "command": "pushGo.open", "title": "Push&Go: Focus" },
+      { "command": "pushGo.commit", "title": "Push&Go: Commit" },
+      { "command": "pushGo.commitPush", "title": "Push&Go: Commit + Push" }
+    ],
+    "configuration": {
+      "title": "Push&Go",
+      "properties": {
+        "pushGo.enableWipGuard": {
+          "type": "boolean",
+          "default": false,
+          "description": "Block commit when the message contains 'WIP' (case-insensitive)."
+        },
+        "pushGo.blockCommitOnMain": {
+          "type": "boolean",
+          "default": true,
+          "description": "Ask for confirmation before committing on 'main' or 'master'."
+        }
+      }
+    },
+    "keybindings": [
+      { "command": "pushGo.commit", "key": "cmd+enter", "mac": "cmd+enter", "when": "view == pushGo.sidebar" },
+      { "command": "pushGo.commitPush", "key": "cmd+shift+enter", "mac": "cmd+shift+enter", "when": "view == pushGo.sidebar" }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "watch": "tsc -w -p .",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.102.0",
+    "@vscode/vsce": "^3.6.0",
+    "typescript": "^5.9.2"
+  }
+}

@@ -2,728 +2,481 @@ import * as vscode from 'vscode';
 import { spawn } from 'child_process';
 import * as path from 'path';
 
-/* ================ UI types ================ */
-type UiMsg =
-  | { type: 'commit'; message: string }
-  | { type: 'push' }
-  | { type: 'commitPush'; message: string }
-  | { type: 'stageAll' }
-  | { type: 'unstageAll' }
-  | { type: 'discardAll' }
-  | { type: 'toggleStageFile'; uri: string; toStage: boolean }
-  | { type: 'discardFile'; uri: string }
-  | { type: 'openDiff'; uri: string }
-  | { type: 'requestState' };
+/* =============== Git bootstrap =============== */
 
-type UiChange = {
-  uri: string;
-  path: string;
-  status: 'M' | 'A' | 'D' | 'R' | 'U' | '??';
-  staged: boolean;
-};
+let gitApi: any | undefined;
 
-type UiState = {
-  repoPath: string;
-  branch: string;
-  upstream?: string | null;
-  changes: UiChange[];
-  canCommit: boolean;
-  lastStatus?: string;
-};
+async function ensureGitApi(): Promise<any | undefined> {
+  if (gitApi) return gitApi;
+  const ext = vscode.extensions.getExtension('vscode.git');
+  if (!ext) return undefined;
+  if (!ext.isActive) {
+    try { await ext.activate(); } catch { /* ignore */ }
+  }
+  // VS Code Git API v1
+  gitApi = ext.exports?.getAPI?.(1);
+  return gitApi;
+}
 
-type UiEvent =
-  | { type: 'state'; state: UiState }
-  | { type: 'status'; text: string }
-  | { type: 'ok'; action: UiMsg['type'] }
-  | { type: 'error'; action: UiMsg['type']; message: string };
+async function waitForRepo(timeoutMs = 2500): Promise<any | undefined> {
+  const api = await ensureGitApi();
+  if (!api) return undefined;
+  if (api.repositories.length) return api.repositories[0];
 
-/* ================ Settings ================ */
+  return new Promise(resolve => {
+    const to = setTimeout(() => {
+      openSub.dispose();
+      resolve(api.repositories[0]);
+    }, timeoutMs);
+    const openSub = api.onDidOpenRepository(() => {
+      clearTimeout(to);
+      openSub.dispose();
+      resolve(api.repositories[0]);
+    });
+  });
+}
+
+function bestRepo(api: any): any | undefined {
+  const repos: any[] = api?.repositories ?? [];
+  if (!repos.length) return undefined;
+
+  const file = vscode.window.activeTextEditor?.document.uri.fsPath;
+  if (file) {
+    // בוחר את הרפו שהשורש שלו הכי "עמוק" בקובץ הפעיל
+    const ranked = repos
+      .filter(r => file.startsWith(r.rootUri.fsPath))
+      .sort((a, b) => b.rootUri.fsPath.length - a.rootUri.fsPath.length);
+    if (ranked[0]) return ranked[0];
+  }
+  return repos[0];
+}
+
+/* =============== Utils =============== */
+
 const SETTINGS = {
   wipGuard: 'pushGo.enableWipGuard',
   blockOnMain: 'pushGo.blockCommitOnMain',
 } as const;
 
-const getSettings = () => {
-  const cfg = vscode.workspace.getConfiguration();
-  return {
-    wipGuard: !!cfg.get<boolean>(SETTINGS.wipGuard),
-blockOnMain: !!cfg.get<boolean>(SETTINGS.blockOnMain),
-  };
-};
+const out = vscode.window.createOutputChannel('Push&Go');
 
-/* ================ Git API (async) ================ */
-type GitAPI = {
-  getAPI(version: number): {
-    repositories: Array<{
-      rootUri: vscode.Uri;
-      state: {
-        HEAD?: { name?: string; upstream?: { name?: string } };
-        indexChanges?: any[];
-        workingTreeChanges?: any[];
-        onDidChange: vscode.Event<void>;
-      };
-      add(paths: string[]): Promise<void>;
-      revert(paths: string[]): Promise<void>;
-      clean(paths: string[]): Promise<void>;
-      commit?(message: string, opts?: { all?: boolean; amend?: boolean; signoff?: boolean; noVerify?: boolean }): Promise<void>;
-      push?(remote?: string, name?: string, setUpstream?: boolean): Promise<void>;
-    }>;
-    toGitUri(uri: vscode.Uri, ref: string): vscode.Uri;
-    git: { path: string };
-    onDidOpenRepository?: vscode.Event<any>;
-  };
-};
-type GitApiReturn = ReturnType<GitAPI['getAPI']>;
-type Repository = NonNullable<GitApiReturn>['repositories'][number];
+function log(...a: any[]) { out.appendLine(a.map(String).join(' ')); }
 
-let gitApi: GitApiReturn | null = null;
-
-async function ensureGitActivated(): Promise<void> {
-  const ext = vscode.extensions.getExtension('vscode.git');
-  if (!ext) throw new Error("The built-in 'Git' extension (vscode.git) is required.");
-  if (!ext.isActive) await ext.activate();
-}
-
-async function getGitApi(): Promise<GitApiReturn | null> {
-  await ensureGitActivated();
-  if (!gitApi) gitApi = (vscode.extensions.getExtension('vscode.git')!.exports as GitAPI).getAPI(1);
-  return gitApi;
-}
-
-async function getRepo(): Promise<Repository | null> {
-  const api = await getGitApi();
-  return api?.repositories?.[0] ?? null;
-}
-
-async function waitForRepo(timeoutMs = 8000): Promise<Repository> {
-  const api = await getGitApi();
-  if (!api) throw new Error('Git API unavailable');
-  if (api.repositories?.[0]) return api.repositories[0];
-
-  const openEvt: vscode.Event<any> | undefined = (api as any).onDidOpenRepository;
-  if (openEvt) {
-    return await new Promise<Repository>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        sub?.dispose();
-        if (api.repositories?.[0]) resolve(api.repositories[0]);
-        else reject(new Error('No Git repository detected (timeout)'));
-      }, timeoutMs);
-      const sub = openEvt((repo: Repository) => {
-        clearTimeout(timer); sub?.dispose(); resolve(repo);
-      });
-    });
-  }
-
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    if (api.repositories?.[0]) return api.repositories[0];
-    await delay(200);
-  }
-  throw new Error('No Git repository detected (timeout)');
-}
-
-/* ================ Utils ================ */
-const debounce = <T extends (...a: any[]) => any>(fn: T, ms: number) => {
-  let t: NodeJS.Timeout | undefined;
-  return (...args: Parameters<T>) => { if (t) clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
-};
-const delay = (ms: number) => new Promise(r => setTimeout(r, ms));
-
-async function runGit(args: string[], cwd: string): Promise<void> {
-  const api = await getGitApi();
-  const gitPath = api?.git?.path || 'git';
-  await new Promise<void>((resolve, reject) => {
-    const ps = spawn(gitPath, args, { cwd, stdio: 'ignore' });
+function runGit(args: string[], cwd: string, input?: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const ps = spawn('git', args, { cwd });
+    let out = '', err = '';
+    ps.stdout.on('data', d => (out += d.toString()));
+    ps.stderr.on('data', d => (err += d.toString()));
+    if (input) { ps.stdin.write(input); ps.stdin.end(); }
     ps.on('error', reject);
-    ps.on('close', (code) =>
-      code === 0 ? resolve() : reject(new Error(`git ${args.join(' ')} exited ${code}`))
-    );
+    ps.on('close', code => code === 0 ? resolve(out.trim())
+      : reject(new Error(err.trim() || `git ${args.join(' ')} exited ${code}`)));
   });
 }
 
-const relPath = (root: vscode.Uri | undefined, u: vscode.Uri) =>
-  root ? path.relative(root.fsPath, u.fsPath) || path.basename(u.fsPath) : u.fsPath;
-
-const toUri = (c: any): vscode.Uri | null => {
-  if (c?.resourceUri instanceof vscode.Uri) return c.resourceUri;
-  if (c?.uri instanceof vscode.Uri) return c.uri;
-  if (typeof c?.uri === 'string') return vscode.Uri.parse(c.uri);
-  return null;
-};
-
-const isRenamed = (s: any, c: any) =>
-  Boolean(c?.renameUri) || /RENAMED/i.test(String(s ?? ''));
-
-const statusRules: Array<{ test: (s: any, c: any) => boolean; code: UiChange['status'] }> = [
-  { test: isRenamed, code: 'R' },
-  { test: (s) => /UNTRACKED|INTENT_TO_ADD/i.test(String(s ?? '')), code: '??' },
-  { test: (s) => /(^|_)ADDED($|_)/i.test(String(s ?? '')) || /(^| )ADDED( |$)/i.test(String(s ?? '')), code: 'A' },
-  { test: (s) => /(^|_)DELETED($|_)/i.test(String(s ?? '')) || /(^| )DELETED( |$)/i.test(String(s ?? '')), code: 'D' },
-  { test: (s) => /BOTH_|ADDED_BY_|DELETED_BY_/i.test(String(s ?? '')), code: 'U' },
-  { test: () => true, code: 'M' },
-];
-
-const mapStatus = (change: any): UiChange['status'] =>
-  (statusRules.find(r => r.test(change?.status, change))?.code) ?? 'M';
-
-async function getCurrentBranch(): Promise<string> {
-  try { return (await getRepo())?.state?.HEAD?.name ?? ''; } catch { return ''; }
+async function getBranch(cwd: string) {
+  try { return await runGit(['rev-parse', '--abbrev-ref', 'HEAD'], cwd); }
+  catch { return ''; }
 }
 
-/* ================ State ================= */
+type UiChange = {
+  path: string; full: string;
+  status: 'M' | 'A' | 'D' | 'R' | 'U' | '??';
+  staged: boolean;
+};
+type UiState = { staged: UiChange[]; unstaged: UiChange[] };
+
+const mapStatus = (s: any, c: any): UiChange['status'] => {
+  const t = String(s ?? '');
+  if (c?.renameUri || /RENAMED/i.test(t)) return 'R';
+  if (/UNTRACKED|INTENT_TO_ADD/i.test(t)) return '??';
+  if (/(^|_)ADDED($|_)/i.test(t) || /(^| )ADDED( |$)/i.test(t)) return 'A';
+  if (/(^|_)DELETED($|_)/i.test(t) || /(^| )DELETED( |$)/i.test(t)) return 'D';
+  if (/BOTH_|ADDED_BY_|DELETED_BY_/i.test(t)) return 'U';
+  return 'M';
+};
+
+function toUiChange(repo: any, change: any, staged: boolean): UiChange {
+  const full = change?.uri?.fsPath ?? '';
+  const rel = full ? path.relative(repo.rootUri.fsPath, full).replace(/\\/g, '/') : '';
+  return { path: rel || full || '(unknown)', full, status: mapStatus(change?.status, change), staged };
+}
+
 async function collectState(): Promise<UiState> {
-  try {
-    const repo = await getRepo();
-    const root = repo?.rootUri;
-    const head = repo?.state?.HEAD;
-    const branch = head?.name ?? '';
-    const upstream = head?.upstream?.name ?? null;
-
-    const idx = Array.isArray(repo?.state?.indexChanges) ? repo!.state!.indexChanges : [];
-    const work = Array.isArray(repo?.state?.workingTreeChanges) ? repo!.state!.workingTreeChanges : [];
-
-    const byUri = new Map<string, { change: any; staged: boolean }>();
-    for (const c of work) {
-      const u = toUri(c);
-      if (u) byUri.set(u.toString(), { change: c, staged: false });
-    }
-    for (const c of idx) {
-      const u = toUri(c);
-      if (u) byUri.set(u.toString(), { change: c, staged: true });
-    }
-
-    const changes: UiChange[] = [...byUri.entries()].map(([u, { change, staged }]) => {
-      const uri = vscode.Uri.parse(u);
-      return { uri: u, path: relPath(root, uri), staged, status: mapStatus(change) };
-    });
-
-    return {
-      repoPath: root?.fsPath ?? '',
-      branch,
-      upstream,
-      changes,
-      canCommit: true,
-      lastStatus: 'Ready',
-    };
-  } catch (e) {
-    return {
-      repoPath: '',
-      branch: '',
-      upstream: null,
-      changes: [],
-      canCommit: false,
-      lastStatus: (e as any)?.message ?? 'Error',
-    };
+  const api = await ensureGitApi();
+  const repo = bestRepo(api) ?? await waitForRepo();
+  if (!repo) {
+    log('collectState: no repo yet');
+    return { staged: [], unstaged: [] };
   }
+  const staged = (repo.state?.indexChanges ?? []).map((c: any) => toUiChange(repo, c, true));
+  const unstaged = (repo.state?.workingTreeChanges ?? []).map((c: any) => toUiChange(repo, c, false));
+  log(`collectState: staged=${staged.length}, unstaged=${unstaged.length}, root=${repo.rootUri.fsPath}`);
+  return { staged, unstaged };
 }
 
-async function collectStateStable(totalTimeoutMs = 8000, settleMs = 350): Promise<UiState> {
-  const repo = await waitForRepo(totalTimeoutMs);
-  const once = new Promise<void>(resolve => {
-    const d = repo.state.onDidChange(() => { d.dispose(); resolve(); });
-  });
-  await vscode.commands.executeCommand('git.refresh');
-  await Promise.race([once, delay(settleMs)]);
-  return collectState();
-}
+/* =============== Extension entry =============== */
 
-/* ================ Guards ================ */
-const guards = {
-  async validateCommitMessage(msg: string) {
-    const message = (msg ?? '').trim();
-    if (!message) throw new Error('Message is required');
-    const { wipGuard, blockOnMain } = getSettings();
-    if (wipGuard && /(^|\s)wip(\s|$)/i.test(message)) throw new Error('WIP is blocked by settings');
-    if (blockOnMain) {
-      const branch = await getCurrentBranch();
-      if (/^(main|master)$/.test(branch)) {
-        const ok = await vscode.window.showInformationMessage(
-          `Commit on ${branch}?`,
-          { modal: true },
-          'Yes', 'No'
-        );
-        if (ok !== 'Yes') throw new Error('Commit cancelled');
-      }
-    }
-    return message;
-  },
-
-  async ensureHasStaged(): Promise<void> {
-    const st = await collectState();
-    const has = st.changes.some(c => c.staged);
-    if (!has) throw new Error('No staged changes. Stage files (checkbox) or click "Stage All".');
-  },
-};
-
-/* ================ Handlers ================ */
-type Handler = (m: any, post: (e: UiEvent) => void) => Thenable<any> | void;
-
-function createHandlers(): Record<UiMsg['type'], Handler> {
-  const doCommit = async (message: string) => {
-    await guards.ensureHasStaged();
-    const repo = await waitForRepo();
-    if (typeof (repo as any).commit === 'function') {
-      await (repo as any).commit(message, { all: false, amend: false });
-    } else {
-      await vscode.commands.executeCommand('git.commit', message);
-    }
-  };
-
-  const doPush = async () => {
-    const repo = await getRepo();
-    const head = repo?.state?.HEAD;
-    const hasUpstream = !!head?.upstream?.name;
-    if (!repo || typeof (repo as any).push !== 'function' || !hasUpstream) {
-      await vscode.commands.executeCommand('git.push');
-      return;
-    }
-    await (repo as any).push();
-  };
-
-  return {
-    commit: async (m: { message: string }) => {
-      const msg = await guards.validateCommitMessage(m.message);
-      await doCommit(msg);
-    },
-
-    push: async () => {
-      await doPush();
-    },
-
-    commitPush: async (m: { message: string }) => {
-      const msg = await guards.validateCommitMessage(m.message);
-      await doCommit(msg);
-      await doPush();
-    },
-
-    stageAll: async () => {
-      const repo = await waitForRepo().catch<Repository | null>(() => null);
-      if (!repo) return;
-      const st = await collectState();
-      const allPaths = st.changes.filter(c => !c.staged).map(c => path.join(st.repoPath, c.path));
-      if (allPaths.length) await repo.add(allPaths);
-    },
-
-    unstageAll: async () => {
-      const repo = await waitForRepo().catch<Repository | null>(() => null);
-      if (!repo) return;
-      await runGit(['reset', '-q', 'HEAD', '--', '.'], repo.rootUri.fsPath);
-    },
-
-    discardAll: async () => {
-      const ok = await vscode.window.showInformationMessage(
-        'Discard ALL working changes?', { modal: true }, 'Yes', 'No'
-      );
-      if (ok !== 'Yes') return;
-      const repo = await waitForRepo().catch<Repository | null>(() => null);
-      if (!repo) return;
-      const st = await collectState();
-      const untracked = st.changes.filter(c => c.status === '??').map(c => path.join(st.repoPath, c.path));
-      const tracked = st.changes.filter(c => c.status !== '??').map(c => path.join(st.repoPath, c.path));
-      if (untracked.length) await repo.clean(untracked);
-      if (tracked.length) await repo.revert(tracked);
-    },
-
-    toggleStageFile: async (m: { uri: string; toStage: boolean }) => {
-      const repo = await waitForRepo().catch<Repository | null>(() => null);
-      if (!repo) return;
-      const file = vscode.Uri.parse(m.uri);
-      const table: Record<string, () => Promise<void>> = {
-        true: () => repo.add([file.fsPath]),
-        false: () =>
-          runGit(
-            ['reset', '-q', 'HEAD', '--', path.relative(repo.rootUri.fsPath, file.fsPath)],
-            repo.rootUri.fsPath
-          ),
-      };
-      await table[String(!!m.toStage)]();
-    },
-
-    discardFile: async (m: { uri: string }) => {
-      const repo = await waitForRepo().catch<Repository | null>(() => null);
-      if (!repo) return;
-      const st = await collectState();
-      const row = st.changes.find(c => c.uri === m.uri);
-      if (!row) return;
-      const filePath = path.join(st.repoPath, row.path);
-      const ok = await vscode.window.showInformationMessage(
-        `Discard changes in ${row.path}?`, { modal: true }, 'Yes', 'No'
-      );
-      if (ok !== 'Yes') return;
-      if (row.status === '??') await repo.clean([filePath]); else await repo.revert([filePath]);
-    },
-
-    openDiff: async (m: { uri: string }) => {
-      const api = await getGitApi(); if (!api) return;
-      const st = await collectState();
-      const row = st.changes.find(c => c.uri === m.uri);
-      const u = vscode.Uri.parse(m.uri);
-      if (row?.status === '??') { await vscode.commands.executeCommand('vscode.open', u); return; }
-      const left = api.toGitUri(u, 'HEAD');
-      const title = `${path.basename(u.fsPath)} (HEAD ↔ Working Tree)`;
-      await vscode.commands.executeCommand('vscode.diff', left, u, title);
-    },
-
-    requestState: async (_m, post) => {
-      try {
-        const state = await collectStateStable(8000, 350);
-        post({ type: 'state', state });
-        post({ type: 'status', text: 'Ready' });
-      } catch {
-        post({ type: 'state', state: { repoPath: '', branch: '', upstream: null, changes: [], canCommit: false, lastStatus: 'No repository' } });
-        post({ type: 'status', text: 'No repository' });
-      }
-    },
-  };
-}
-
-/* ================ Webview Provider ================ */
-class PushGoViewProvider implements vscode.WebviewViewProvider {
-  static readonly VIEW_ID = 'pushGo.sidebar';
-  constructor(private readonly context: vscode.ExtensionContext) {}
-
-  resolveWebviewView(webviewView: vscode.WebviewView) {
-    try {
-      const { webview } = webviewView;
-      webview.options = { enableScripts: true };
-      webview.html = getHtml(webview);
-
-      const handlers = createHandlers();
-      const post = (e: UiEvent) => webview.postMessage(e);
-
-      post({ type: 'status', text: 'Loading…' });
-
-      webview.onDidReceiveMessage(
-        async (m: UiMsg) => {
-          try {
-            await handlers[m.type]?.(m as any, post);
-            if (m.type !== 'requestState') {
-              post({ type: 'state', state: await collectStateStable(8000, 200) });
-              post({ type: 'ok', action: m.type });
-            }
-          } catch (e: any) {
-            const msg = e?.message ?? String(e);
-            console.error('[Push&Go] onDidReceiveMessage error:', e);
-            vscode.window.showErrorMessage(`Push&Go: ${msg}`);
-            post({ type: 'error', action: (m as any).type, message: msg });
-          }
-        },
-        undefined,
-        this.context.subscriptions
-      );
-
-      (async () => {
-        try {
-          const api = await getGitApi();
-          const repoNow = api?.repositories?.[0];
-          const emitState = debounce(async () => {
-            try { post({ type: 'state', state: await collectState() }); }
-            catch (e: any) { post({ type: 'status', text: e?.message ?? 'Update error' }); }
-          }, 250);
-
-          if (repoNow) {
-            const sub = repoNow.state.onDidChange(() => emitState());
-            this.context.subscriptions.push(sub);
-          }
-
-          const openEvt: vscode.Event<any> | undefined = (api as any)?.onDidOpenRepository;
-          if (openEvt) {
-            const disp = openEvt(async () => { await emitState(); });
-            this.context.subscriptions.push(disp as any);
-          }
-        } catch (e: any) {
-          console.error('[Push&Go] subscribe error:', e);
-        }
-      })();
-
-      (async () => {
-        try {
-          const state = await collectStateStable(8000, 350);
-          post({ type: 'state', state });
-          post({ type: 'status', text: 'Ready' });
-        } catch {
-          post({ type: 'status', text: 'No repository' });
-        }
-      })();
-
-      webviewView.onDidChangeVisibility(() => {
-        if (webviewView.visible) handlers.requestState?.({ type: 'requestState' }, post);
-      });
-
-    } catch (e: any) {
-      const { webview } = webviewView;
-      const msg = e?.message ?? String(e);
-      console.error('[Push&Go] resolveWebviewView fatal:', e);
-      webview.options = { enableScripts: true };
-      webview.html = `<!doctype html>
-        <meta charset="utf-8">
-        <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'none';">
-        <style>body{font:13px/1.4 ui-sans-serif,system-ui;-webkit-font-smoothing:antialiased;margin:0;padding:16px;background:#1e1e1e;color:#eee}</style>
-        <h3>Push&Go</h3>
-        <p>❌ Init error: <code>${escapeHtml(msg)}</code></p>`;
-      function escapeHtml(s: string) {
-        return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]!));
-      }
-    }
-  }
-}
-
-/* ================ Entry ================ */
 export function activate(context: vscode.ExtensionContext) {
+  out.show(true); // תיעוד זמין
+  const provider = new PushGoViewProvider(context);
   context.subscriptions.push(
-    vscode.window.registerWebviewViewProvider(PushGoViewProvider.VIEW_ID, new PushGoViewProvider(context))
-  );
-
-  context.subscriptions.push(
-    vscode.commands.registerCommand('pushGo.open', async () => {
-      await ensureGitActivated();
-      await vscode.commands.executeCommand('workbench.view.extension.pushGo');
-    })
-  );
-
-  const handlers = createHandlers();
-  const postNoop = (_: UiEvent) => {};
-
-  context.subscriptions.push(
-    vscode.commands.registerCommand('pushGo.commit', async () => {
-      const message = await vscode.window.showInputBox({
-        prompt: 'Commit message',
-        placeHolder: 'Required…',
-        validateInput: v => (!v?.trim() ? 'Message is required' : undefined),
-      });
-      if (!message) return;
-      await handlers.commit({ message }, postNoop);
-    }),
-    vscode.commands.registerCommand('pushGo.commitPush', async () => {
-      const message = await vscode.window.showInputBox({
-        prompt: 'Commit message',
-        placeHolder: 'Required…',
-        validateInput: v => (!v?.trim() ? 'Message is required' : undefined),
-      });
-      if (!message) return;
-      await handlers.commitPush({ message }, postNoop);
-    })
+    vscode.window.registerWebviewViewProvider(PushGoViewProvider.VIEW_ID, provider, { webviewOptions: { retainContextWhenHidden: true } }),
+    vscode.commands.registerCommand('pushGo.open', () => vscode.commands.executeCommand('workbench.view.extension.pushGo')),
+    vscode.commands.registerCommand('pushGo.commit', () => handlers.commitCommand()),
+    vscode.commands.registerCommand('pushGo.commitPush', () => handlers.commitPushCommand()),
   );
 }
 
 export function deactivate() {}
 
-/* ================ HTML (webview) ================ */
-function getHtml(webview: vscode.Webview): string {
-  const nonce = String(Date.now()) + Math.random().toString(36).slice(2);
-  return /* html */ `<!doctype html>
-<html>
+class PushGoViewProvider implements vscode.WebviewViewProvider {
+  static readonly VIEW_ID = 'pushGo.sidebar';
+  private webview?: vscode.Webview;
+
+  constructor(private readonly ctx: vscode.ExtensionContext) {}
+
+  postToView(msg: any) { this.webview?.postMessage(msg); }
+
+  resolveWebviewView(webviewView: vscode.WebviewView) {
+    const { webview } = webviewView;
+    this.webview = webview;
+    webview.options = { enableScripts: true };
+    webview.html = getHtml();
+
+    const post = (e: any) => webview.postMessage(e);
+    const pushState = async () => post({ type: 'state', state: await collectState() });
+
+    // מסרים מה־UI
+    webview.onDidReceiveMessage(async (m: any) => {
+      try {
+        await (handlers[m?.type] ?? (async () => {}))(m);
+        if (m?.type !== 'requestState') { await pushState(); post({ type: 'ok', action: m?.type }); }
+      } catch (err: any) {
+        const msg = err?.message ?? String(err);
+        vscode.window.showErrorMessage(`Push&Go: ${msg}`);
+        post({ type: 'error', action: m?.type, message: msg });
+      }
+    }, undefined, this.ctx.subscriptions);
+
+    // רענון ע״פ אירועים
+    (async () => {
+      const api = await ensureGitApi();
+      const repo = bestRepo(api) ?? await waitForRepo();
+
+      const subs: vscode.Disposable[] = [];
+      if (repo?.state?.onDidChange) subs.push(repo.state.onDidChange(() => void pushState()));
+      if (api?.onDidOpenRepository) subs.push(api.onDidOpenRepository(() => void pushState()));
+      if (api?.onDidCloseRepository) subs.push(api.onDidCloseRepository(() => void pushState()));
+      subs.push(vscode.window.onDidChangeActiveTextEditor(() => void pushState()));
+      subs.push(vscode.workspace.onDidSaveTextDocument(() => void pushState()));
+      this.ctx.subscriptions.push(...subs);
+
+      // שליחה ראשונית + עדכון ידני
+      setTimeout(() => void pushState(), 0);
+    })();
+  }
+}
+
+/* =============== Webview (compact UI) =============== */
+
+function getHtml() {
+  return /* html */ `
+<!doctype html>
+<html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta http-equiv="Content-Security-Policy"
-        content="
-          default-src 'none';
-          img-src ${webview.cspSource} https: data:;
-          style-src ${webview.cspSource} 'unsafe-inline';
-          script-src 'nonce-${nonce}';
-          font-src ${webview.cspSource};
-          connect-src ${webview.cspSource};
-        ">
-  <style>
-    :root { --pad:12px; --bg:#0f1115; --fg:#e5e7eb; --muted:#9aa0a6; --bd:#2a2f3a; }
-    html,body { height:100%; }
-    body { margin:0; background:var(--bg); color:var(--fg); font:13px/1.4 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto; display:flex; flex-direction:column; }
-    header { display:flex; gap:8px; align-items:center; padding:var(--pad); border-bottom:1px solid var(--bd); }
-    .muted { color:var(--muted); }
-    .link { text-decoration: underline; cursor:pointer; }
-    .bd { border-top:1px solid var(--bd); }
-    .row { display:flex; align-items:center; gap:8px; padding:6px 0; }
-    .file { flex:1; cursor:pointer; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-    .chips { font-size:11px; opacity:.8; }
-    button { padding:8px 10px; border-radius:10px; border:1px solid var(--bd); background:#151a22; color:inherit; cursor:pointer; }
-    button:disabled { opacity:0.5; cursor:not-allowed; }
+<meta charset="UTF-8" />
+<meta http-equiv="Content-Security-Policy"
+  content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline';" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+:root{
+  --fg: var(--vscode-foreground);
+  --muted: var(--vscode-descriptionForeground);
+  --bg: var(--vscode-sideBar-background);
+  --panel: var(--vscode-editor-background);
+  --border: var(--vscode-panel-border, #2a2a2a);
+  --accent: var(--vscode-button-background);
+  --accent-ctrl: var(--vscode-button-foreground);
+  --font: var(--vscode-font-family, ui-sans-serif, system-ui);
+  --fs-12: 12px; --fs-11: 11px;
+  --radius: 6px; --gap: 8px;
+  --row-h: 26px; --btn-h: 24px;
+}
+*{ box-sizing:border-box; } html,body{ height:100%; }
+body{ margin:0; color:var(--fg); background:var(--bg); font: normal var(--fs-12)/1.4 var(--font); }
+.wrap{ display:grid; grid-template-rows:auto auto 1fr auto; height:100%; }
 
-    /* Layout: changes first (scroll) + commit pane always visible */
-    .changesWrap { padding:0 var(--pad); flex:1; overflow:auto; }
-    .changesHead { display:flex; align-items:center; gap:8px; padding: var(--pad) var(--pad) 6px; }
-    .actions { margin-left:auto; display:flex; gap:12px; }
+/* counts row */
+.countsRow{ padding:8px 10px 4px; border-bottom:1px solid var(--border); color:var(--muted); }
+/* actions row (each link בשורה משלה) */
+.actions{ padding:4px 10px 8px; border-bottom:1px solid var(--border); display:flex; flex-direction:column; gap:6px; }
+.link{ text-decoration:none; color:var(--fg); opacity:.9; font-size:var(--fs-11); }
+.link:hover{ text-decoration:underline; }
 
-    .group { margin: 8px 0 14px; }
-    .groupHeader { display:flex; align-items:center; justify-content:space-between; cursor:pointer; padding:6px 4px; }
-    .groupTitle { font-weight:600; }
-    .groupCount { font-size:12px; color:var(--muted); }
-    .groupBody { margin-top:6px; }
+/* list area */
+.main{ overflow:auto; padding:10px; }
+.group{ margin-top: 6px; }
+.ttl{ margin:6px 0; font-weight:600; font-size:12px; display:flex; gap:8px; align-items:center; }
+.empty{ color:var(--muted); font-style:italic; padding:6px 0 8px; }
 
-    .commitPane { padding: var(--pad); border-top:1px solid var(--bd); background: rgba(15,17,21,0.98); }
-    .commitBar { display:flex; gap:8px; align-items:center; margin-bottom:8px; flex-wrap:wrap; }
-    textarea { width:100%; min-height:68px; padding:10px; border-radius:10px; border:1px solid var(--bd); background:transparent; color:inherit; outline:none; }
-    .status { font-size:12px; color:var(--muted); padding: 6px var(--pad) var(--pad); }
-    .empty { padding:8px; color:var(--muted); font-style:italic; }
-  </style>
+.list{ display:flex; flex-direction:column; gap:2px; }
+.row{
+  display:grid; grid-template-columns:18px 1fr auto auto; align-items:center;
+  min-height:var(--row-h); border-radius:var(--radius); padding:0 6px; border:1px solid transparent;
+}
+.row:hover{ background: color-mix(in oklab, var(--panel) 70%, transparent); border-color:var(--border); }
+.chk{ width:14px; height:14px; }
+.name{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; padding-right:6px; }
+.badge{ font-size:var(--fs-11); color:var(--muted); padding:0 6px; }
+
+/* buttons */
+.btn{
+  height:var(--btn-h); padding:0 10px; border-radius:var(--radius);
+  border:1px solid var(--border); background:transparent; color:var(--fg);
+  font-size:var(--fs-12); cursor:pointer;
+}
+.btn:hover{ filter:brightness(1.05); }
+.btn.primary{ background:var(--accent); color:var(--accent-ctrl); border-color:transparent; font-weight:600; }
+.btn.sm{ height:20px; padding:0 6px; font-size:var(--fs-11); color:var(--muted); }
+
+/* footer */
+.ftr{ position:sticky; bottom:0; border-top:1px solid var(--border); padding:8px 10px; background:var(--bg); }
+.btns{ display:flex; gap:8px; flex-wrap:wrap; }
+textarea{
+  width:100%; min-height:64px; max-height:140px; resize:vertical;
+  border-radius:var(--radius); border:1px solid var(--border);
+  background:var(--panel); color:var(--fg); padding:8px;
+  font: normal var(--fs-12)/1.4 var(--font);
+}
+</style>
 </head>
 <body>
-  <header><strong>Push&Go</strong><span class="muted">&nbsp;– Commit / Push fast</span></header>
+  <div class="wrap">
+    <div class="countsRow"><span id="counts">0 staged · 0 unstaged</span></div>
+    <div class="actions">
+      <a class="link" href="#" data-action="stageAll">Stage All</a>
+      <a class="link" href="#" data-action="unstageAll">Unstage All</a>
+      <a class="link" href="#" data-action="discardAll">Discard All</a>
+      <a class="link" href="#" data-action="refresh">Refresh</a>
+    </div>
 
-  <!-- CHANGES (scrolls) -->
-  <div class="changesWrap">
-    <div class="changesHead bd">
-      <div class="muted">Changes</div>
-      <div class="actions">
-        <span id="stageAll" class="link">Stage All</span>
-        <span id="unstageAll" class="link">Unstage All</span>
-        <span id="discardAll" class="link">Discard All</span>
+    <div class="main">
+      <div class="group">
+        <div class="ttl">Staged <span id="stagedCount" style="color:var(--muted)"></span></div>
+        <div id="stagedList" class="list"><div class="empty">No files</div></div>
+      </div>
+      <div class="group">
+        <div class="ttl">Unstaged <span id="unstagedCount" style="color:var(--muted)"></span></div>
+        <div id="unstagedList" class="list"><div class="empty">No files</div></div>
       </div>
     </div>
 
-    <div id="groups">
-      <div class="empty" style="padding:8px ${webview.cspSource ? '0' : '0'};">Loading…</div>
+    <div class="ftr">
+      <div class="btns">
+        <button class="btn" data-action="commit">Commit</button>
+        <button class="btn" data-action="push">Push</button>
+        <button class="btn primary" data-action="commitPush">Commit &amp; Push</button>
+      </div>
+      <label style="color:var(--muted); font-size:11px; display:block; margin-top:6px;">Commit message *</label>
+      <textarea id="msg" placeholder="Required…"></textarea>
     </div>
   </div>
 
-  <!-- COMMIT (always visible) -->
-  <div class="commitPane">
-    <div class="commitBar">
-      <button id="commit" disabled>Commit</button>
-      <button id="push">Push</button>
-      <button id="commitPush" disabled>Commit & Push</button>
-    </div>
-    <div class="muted" style="margin-bottom:6px;">Commit message *</div>
-    <textarea id="msg" placeholder="Required…"></textarea>
-  </div>
+<script>
+const vscode = acquireVsCodeApi();
+const $ = (s, r=document) => r.querySelector(s);
+const post = (type, payload={}) => vscode.postMessage({ type, ...payload });
 
-  <div class="status" id="status">Loading…</div>
+const makeRow = (item) => {
+  const el = document.createElement('div');
+  el.className = 'row';
+  el.innerHTML = \`
+    <input class="chk" type="checkbox" \${item.staged ? 'checked' : ''} data-path="\${item.path}" aria-label="stage-toggle" />
+    <div class="name" title="\${item.full}" data-action="openDiff" data-path="\${item.path}">\${item.path}</div>
+    <span class="badge">\${item.status}</span>
+    <button class="btn sm" data-action="discard" data-path="\${item.path}">Discard</button>
+  \`;
+  return el;
+};
 
-  <script nonce="${nonce}">
-    const vscode = acquireVsCodeApi();
-    const $ = (id) => document.getElementById(id);
+function render(state){
+  const staged = state?.staged ?? [];
+  const unstaged = state?.unstaged ?? [];
+  const stageList = $('#stagedList'), unList = $('#unstagedList');
+  const sc = $('#stagedCount'), uc = $('#unstagedCount'), counts = $('#counts');
 
-    // Persist group collapsed state in VS Code webview state
-    const persisted = vscode.getState() || {};
-    const collapsed = persisted.collapsed || { staged: false, unstaged: false };
+  const paint = (node, items) => {
+    node.innerHTML = '';
+    if(!items.length){ node.innerHTML = '<div class="empty">No files</div>'; return; }
+    items.forEach(i => node.appendChild(makeRow(i)));
+  };
 
-    let isReady = false;
-    let didInitialRefresh = false;
-    let lastState = null;
+  paint(stageList, staged);
+  paint(unList, unstaged);
+  sc.textContent = staged.length;
+  uc.textContent = unstaged.length;
+  counts.textContent = \`\${staged.length} staged · \${unstaged.length} unstaged\`;
+}
 
-    const setStatus = (t) => {
-      $('status').textContent = t || '';
-      if (t === 'Ready') {
-        const first = !isReady;
-        isReady = true;
-        if (lastState) render(lastState);
-        if (first && !didInitialRefresh) { didInitialRefresh = true; vscode.postMessage({ type: 'requestState' }); }
-        return;
-      }
-      isReady = false;
-      $('groups').innerHTML = '<div class="empty">Loading…</div>';
-    };
+document.addEventListener('click', (e) => {
+  const a = e.target.closest('[data-action]');
+  if(!a) return;
+  e.preventDefault();
+  const act = a.getAttribute('data-action');
+  ({
+    refresh:    () => post('requestState'),
+    stageAll:   () => post('stageAll'),
+    unstageAll: () => post('unstageAll'),
+    discardAll: () => post('discardAll'),
+    commit:     () => post('commit', { message: $('#msg').value }),
+    push:       () => post('push'),
+    commitPush: () => post('commitPush', { message: $('#msg').value }),
+    discard:    () => post('discard', { path: a.getAttribute('data-path') }),
+    openDiff:   () => post('openDiff', { path: a.getAttribute('data-path') }),
+  }[act] || (()=>{}))();
+});
 
-    const send = (type, extra={}) => vscode.postMessage({ type, ...extra });
+document.addEventListener('change', (e) => {
+  const cb = e.target.closest('input[type="checkbox"][data-path]');
+  if(!cb) return;
+  const path = cb.getAttribute('data-path');
+  post(cb.checked ? 'stageFile' : 'unstageFile', { path });
+});
 
-    const recomputeCommitButtons = () => {
-      const hasMsg = !!$('msg').value.trim();
-      const hasStaged = !!(lastState?.changes?.some(c => c.staged));
-      $('commit').disabled = !(hasMsg && hasStaged);
-      $('commitPush').disabled = !(hasMsg && hasStaged);
-      if (!hasMsg) $('status').textContent = 'Message is required';
-      else if (!hasStaged) $('status').textContent = 'Stage at least one file to commit';
-      else $('status').textContent = 'Ready';
-    };
+window.addEventListener('message', (ev) => {
+  const m = ev.data;
+  ({ state: () => render(m.state) }[m.type] || (()=>{}))();
+});
 
-    $('msg').addEventListener('input', () => recomputeCommitButtons());
-    $('commit').onclick     = () => send('commit',     { message: $('msg').value.trim() });
-    $('push').onclick       = () => send('push');
-    $('commitPush').onclick = () => send('commitPush', { message: $('msg').value.trim() });
+post('requestState');
+</script>
+</body>
+</html>
+`;
+}
 
-    $('stageAll').onclick   = () => send('stageAll');
-    $('unstageAll').onclick = () => send('unstageAll');
-    $('discardAll').onclick = () => send('discardAll');
+/* =============== Handlers =============== */
 
-    const makeGroup = (key, title, items) => {
-      const wrapper = document.createElement('div');
-      wrapper.className = 'group';
+// המיפוי נשאר עם פרמטר אופציונלי כדי לאפשר קריאות בלי ארגומנט
+const handlers: Record<string, (m?: any) => Promise<void>> = {
+  requestState: async () => { /* handled per-view */ },
 
-      const head = document.createElement('div');
-      head.className = 'groupHeader';
-      const t = document.createElement('div');
-      t.className = 'groupTitle';
-      t.textContent = title;
-      const count = document.createElement('div');
-      count.className = 'groupCount';
-      count.textContent = items.length.toString();
-      head.appendChild(t); head.appendChild(count);
-      wrapper.appendChild(head);
+  /* List actions: all */
+  stageAll: async () => {
+    const api = await ensureGitApi(); const repo = bestRepo(api) ?? await waitForRepo(); if (!repo) return;
+    await runGit(['add', '-A'], repo.rootUri.fsPath);
+  },
+  unstageAll: async () => {
+    const api = await ensureGitApi(); const repo = bestRepo(api) ?? await waitForRepo(); if (!repo) return;
+    await runGit(['reset', '-q', 'HEAD', '--', '.'], repo.rootUri.fsPath);
+  },
+  discardAll: async () => {
+    const api = await ensureGitApi(); const repo = bestRepo(api) ?? await waitForRepo(); if (!repo) return;
+    const confirm = await vscode.window.showWarningMessage('Discard ALL local changes? This cannot be undone.', { modal: true }, 'Discard');
+    if (confirm !== 'Discard') return;
+    try { await runGit(['restore', '--worktree', '--staged', '--source=HEAD', '.'], repo.rootUri.fsPath); }
+    catch { await runGit(['checkout', '--', '.'], repo.rootUri.fsPath); }
+    await runGit(['clean', '-fd'], repo.rootUri.fsPath);
+  },
 
-      const body = document.createElement('div');
-      body.className = 'groupBody';
-      wrapper.appendChild(body);
-
-      const toggle = () => {
-        collapsed[key] = !collapsed[key];
-        vscode.setState({ ...vscode.getState(), collapsed });
-        body.style.display = collapsed[key] ? 'none' : 'block';
-      };
-      head.onclick = toggle;
-
-      body.style.display = collapsed[key] ? 'none' : 'block';
-
-      if (!items.length) {
-        body.innerHTML = '<div class="empty">No files</div>';
-        return wrapper;
-      }
-
-      items.forEach(ch => {
-        const row = document.createElement('div'); row.className = 'row';
-
-        const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = !!ch.staged;
-        cb.onchange = () => send('toggleStageFile', { uri: ch.uri, toStage: cb.checked });
-
-        const file = document.createElement('div');
-        file.className = 'file';
-        file.textContent = ch.path;
-        file.title = ch.uri;
-        file.onclick = () => send('openDiff', { uri: ch.uri });
-
-        const chips = document.createElement('div'); chips.className = 'chips muted'; chips.textContent = ch.status;
-
-        const discard = document.createElement('button'); discard.textContent = 'Discard';
-        discard.onclick = () => send('discardFile', { uri: ch.uri });
-
-        row.appendChild(cb); row.appendChild(file); row.appendChild(chips); row.appendChild(discard);
-        body.appendChild(row);
-      });
-
-      return wrapper;
-    };
-
-    function render(state) {
-      lastState = state;
-      const box = $('groups');
-      if (!isReady) { box.innerHTML = '<div class="empty">Loading…</div>'; return; }
-
-      const staged   = (state.changes || []).filter(c => c.staged);
-      const unstaged = (state.changes || []).filter(c => !c.staged);
-
-      box.innerHTML = '';
-      // Staged first
-      [
-        { key: 'staged',   title: 'Staged',   items: staged   },
-        { key: 'unstaged', title: 'Unstaged', items: unstaged },
-      ].forEach(g => box.appendChild(makeGroup(g.key, g.title, g.items)));
-
-      recomputeCommitButtons();
+  /* Per file */
+  stageFile: async (m) => {
+    const api = await ensureGitApi(); const repo = bestRepo(api) ?? await waitForRepo(); if (!repo) return;
+    await runGit(['add', '--', m.path], repo.rootUri.fsPath);
+  },
+  unstageFile: async (m) => {
+    const api = await ensureGitApi(); const repo = bestRepo(api) ?? await waitForRepo(); if (!repo) return;
+    await runGit(['reset', '-q', 'HEAD', '--', m.path], repo.rootUri.fsPath);
+  },
+  discard: async (m) => {
+    const api = await ensureGitApi(); const repo = bestRepo(api) ?? await waitForRepo(); if (!repo) return;
+    const isUntracked = !!(await runGit(['ls-files', '--others', '--exclude-standard', '--', m.path], repo.rootUri.fsPath)).trim();
+    if (isUntracked) await runGit(['clean', '-f', '--', m.path], repo.rootUri.fsPath);
+    else {
+      try { await runGit(['restore', '--worktree', '--staged', '--source=HEAD', '--', m.path], repo.rootUri.fsPath); }
+      catch { await runGit(['checkout', '--', m.path], repo.rootUri.fsPath); }
     }
+  },
 
-    window.addEventListener('message', (ev) => {
-      const msg = ev.data || {};
-      const table = {
-        state:  () => { render(msg.state); },
-        status: () => { setStatus(msg.text || ''); if (msg.text === 'No repository') $('groups').innerHTML = '<div class="empty">No Git repository in workspace</div>'; },
-        ok:     () => { $('status').textContent = '✓ ' + msg.action + ' done'; },
-        error:  () => { $('status').textContent = '⚠ ' + (msg.message || 'Error'); }
-      };
-      table[msg.type]?.();
+  openDiff: async (m) => {
+    const api = await ensureGitApi(); const repo = bestRepo(api) ?? await waitForRepo(); if (!repo) return;
+
+    // בונים את ה-URI של הקובץ הנוכחי
+    const abs = path.join(repo.rootUri.fsPath, m.path);
+    const fileUri = vscode.Uri.file(abs);
+
+    // מחפשים את ה-change כדי לזהות rename (אם יש)
+    const all = [
+      ...(repo.state?.indexChanges ?? []),
+      ...(repo.state?.workingTreeChanges ?? []),
+      ...(repo.state?.mergeChanges ?? []),
+    ];
+    const changeForFile = all.find((c: any) => c?.uri?.fsPath === fileUri.fsPath);
+    const leftFsPath = changeForFile?.renameUri?.fsPath ?? fileUri.fsPath; // אם rename – נשתמש בישן
+
+    // git:URI תקין לפי הפורמט של Git provider (query כ-JSON עם path+ref)
+    const left = vscode.Uri.from({
+      scheme: 'git',
+      path: vscode.Uri.file(leftFsPath).path, // לשם/תצוגה
+      query: JSON.stringify({ path: leftFsPath, ref: 'HEAD' }), // לשחזור התוכן מ-HEAD
     });
 
-    $('groups').innerHTML = '<div class="empty">Loading…</div>';
-    $('status').textContent = 'Loading…';
-    vscode.postMessage({ type: 'requestState' });
-  </script>
-</body>
-</html>`;
-}
+    const title =
+      changeForFile?.renameUri
+        ? `${m.path} (from ${path.relative(repo.rootUri.fsPath, changeForFile.renameUri.fsPath)})`
+        : m.path;
+
+    await vscode.commands.executeCommand('vscode.diff', left, fileUri, title);
+  },
+
+  /* Commit / Push */
+  commit: async (m) => {
+    const api = await ensureGitApi(); const repo = bestRepo(api) ?? await waitForRepo(); if (!repo) return;
+    const message = String(m?.message ?? '').trim();
+    if (!message) throw new Error('Commit message is required.');
+
+    const cfg = vscode.workspace.getConfiguration();
+    if (cfg.get<boolean>(SETTINGS.wipGuard) && /(^|\s)wip(\s|$)/i.test(message)) {
+      throw new Error(`WIP is blocked by settings (${SETTINGS.wipGuard}).`);
+    }
+    if (cfg.get<boolean>(SETTINGS.blockOnMain)) {
+      const b = await getBranch(repo.rootUri.fsPath);
+      if (['main', 'master'].includes(b)) {
+        const ok = await vscode.window.showWarningMessage(`Commit on "${b}"?`, { modal: true }, 'Commit');
+        if (ok !== 'Commit') return;
+      }
+    }
+    await runGit(['commit', '-m', message, '--no-gpg-sign'], repo.rootUri.fsPath);
+  },
+
+  push: async () => {
+    const api = await ensureGitApi(); const repo = bestRepo(api) ?? await waitForRepo(); if (!repo) return;
+    try { await runGit(['push'], repo.rootUri.fsPath); }
+    catch (e: any) {
+      if (/no upstream branch/i.test(String(e?.message ?? ''))) {
+        const branch = await getBranch(repo.rootUri.fsPath);
+        await runGit(['push', '-u', 'origin', branch], repo.rootUri.fsPath);
+      } else { throw e; }
+    }
+  },
+
+  commitPush: async (m) => { await handlers.commit(m); await handlers.push(m); },
+
+  // Command palette helpers (open input box)
+  commitCommand: async () => {
+    const msg = await vscode.window.showInputBox({
+      prompt: 'Commit message', placeHolder: 'Required…',
+      validateInput: v => v.trim() ? undefined : 'Message required'
+    });
+    if (msg) await handlers.commit({ message: msg });
+  },
+  commitPushCommand: async () => {
+    const msg = await vscode.window.showInputBox({
+      prompt: 'Commit message', placeHolder: 'Required…',
+      validateInput: v => v.trim() ? undefined : 'Message required'
+    });
+    if (msg) await handlers.commitPush({ message: msg });
+  },
+};

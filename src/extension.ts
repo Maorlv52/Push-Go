@@ -651,6 +651,12 @@ window.addEventListener('message', (ev) => {
         unstageAll:    () => { const all = state.staged.map(i=>i.path); move(all, 'staged', 'unstaged'); render(state); },
         discardAll:    () => { state = { staged: [], unstaged: [] }; render(state); },
       }[op] || (()=>{}))();
+    },
+      clearMsg: () => {
+      $msg.value = '';
+      const next = { ...(vscode.getState?.() || {}), msg: '' };
+      vscode.setState?.(next);
+      setCommitButtons();
     }
   }[m.type] || (()=>{}))();
 });
@@ -824,6 +830,9 @@ const handlers: Record<string, (m?: any) => Promise<void>> = {
     }
     try { await repo.commit(message, {}); }
     catch { await runGit(['commit', '-m', message, '--no-gpg-sign'], cwd); }
+
+    // notify webview to clear commit message
+    postToViewGlobal?.({ type: 'clearMsg' });
   }),
 
   push: async () => {
@@ -1009,6 +1018,10 @@ async function commitThisFromExplorer(uri?: vscode.Uri, uris?: vscode.Uri[]) {
     try { await repo.commit(msg.trim(), {}); }
     catch { await runGit(['commit', '-m', msg.trim(), '--no-gpg-sign', '--', ...paths], cwd); }
 
+    // notify webview to clear commit message if it’s open
+    postToViewGlobal?.({ type: 'clearMsg' });
+
     vscode.window.showInformationMessage(`Push&Go: Committed ${stagedSubset.length} file(s).`);
+
   });
 }

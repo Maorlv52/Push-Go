@@ -79,6 +79,98 @@ async function getBranch(cwd: string) {
   try { return await runGit(['rev-parse', '--abbrev-ref', 'HEAD'], cwd); }
   catch { return ''; }
 }
+async function hasHead(cwd: string): Promise<boolean> {
+  try { await runGit(['rev-parse', '--verify', 'HEAD'], cwd); return true; }
+  catch { return false; }
+}
+async function ensureGitAvailable(): Promise<boolean> {
+  try { await runGit(['--version'], process.cwd()); return true; }
+  catch {
+    vscode.window.showErrorMessage('Push&Go: לא נמצא Git במערכת. התקן Git ודא שהוא זמין ב-PATH.');
+    return false;
+  }
+}
+
+/* ---- NEW: precise state helpers ---- */
+async function getStagedFiles(cwd: string): Promise<string[]> {
+  try {
+    const s = await runGit(['diff', '--cached', '--name-only'], cwd);
+    return s.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
+  } catch { return []; }
+}
+
+async function getUpstreamRef(cwd: string): Promise<string> {
+  try { return await runGit(['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'], cwd); }
+  catch { return ''; } // no upstream
+}
+
+async function countAhead(cwd: string): Promise<number | null> {
+  const upstream = await getUpstreamRef(cwd);
+  if (!upstream) return null; // unknown (no upstream)
+  try {
+    const n = await runGit(['rev-list', '--count', '@{u}..HEAD'], cwd);
+    return Number(n || '0') || 0;
+  } catch { return 0; }
+}
+
+/* small helpers */
+function debounce<F extends (...args: any[]) => any>(fn: F, ms = 150) {
+  let t: any;
+  return (...args: Parameters<F>) => {
+    if (t) clearTimeout(t);
+    t = setTimeout(() => fn(...args), ms);
+  };
+}
+
+/* remotes helpers */
+async function listRemotes(cwd: string): Promise<string[]> {
+  try {
+    const s = await runGit(['remote'], cwd);
+    return s.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+async function addRemote(cwd: string, name: string, url: string): Promise<void> {
+  await runGit(['remote', 'add', name, url], cwd);
+}
+async function pickOrCreateRemote(cwd: string): Promise<string | undefined> {
+  const remotes = await listRemotes(cwd);
+  if (remotes.length === 1) return remotes[0];
+
+  const items = [
+    ...remotes.map(r => ({ label: r, description: 'Use existing remote' })),
+    { label: '+ Add remote…', description: 'Add and push to a new remote' },
+  ];
+  const pick = await vscode.window.showQuickPick(items, {
+    placeHolder: 'בחר remote ל־upstream (git push -u)',
+    ignoreFocusOut: true,
+  });
+  if (!pick) return;
+
+  if (pick.label.startsWith('+')) {
+    const defaultName = remotes.includes('origin') ? '' : 'origin';
+    const name = await vscode.window.showInputBox({
+      prompt: 'Remote name',
+      value: defaultName,
+      validateInput: v => v.trim() ? undefined : 'Required',
+      ignoreFocusOut: true,
+    });
+    if (!name) return;
+
+    const url = await vscode.window.showInputBox({
+      prompt: 'Remote URL (https:// או ssh://)',
+      placeHolder: 'https://github.com/you/repo.git או git@github.com:you/repo.git',
+      validateInput: v => v.trim() ? undefined : 'Required',
+      ignoreFocusOut: true,
+    });
+    if (!url) return;
+
+    await addRemote(cwd, name.trim(), url.trim());
+    return name.trim();
+  }
+  return pick.label.trim();
+}
 
 type UiChange = {
   path: string; full: string;
@@ -103,6 +195,16 @@ function toUiChange(repo: any, change: any, staged: boolean): UiChange {
   return { path: rel || full || '(unknown)', full, status: mapStatus(change?.status, change), staged };
 }
 
+function dedupeByFull<T extends UiChange>(arr: T[]) {
+  const seen = new Set<string>();
+  const out: T[] = [];
+  for (const i of arr) {
+    const key = `${i.full}|${i.staged}`;
+    if (!seen.has(key)) { seen.add(key); out.push(i); }
+  }
+  return out;
+}
+
 async function collectState(): Promise<UiState> {
   const api = await ensureGitApi();
   const repo = bestRepo(api) ?? await waitForRepo();
@@ -110,8 +212,12 @@ async function collectState(): Promise<UiState> {
     log('collectState: no repo yet');
     return { staged: [], unstaged: [] };
   }
+
   const staged = (repo.state?.indexChanges ?? []).map((c: any) => toUiChange(repo, c, true));
-  const unstaged = (repo.state?.workingTreeChanges ?? []).map((c: any) => toUiChange(repo, c, false));
+  const unstagedWT = (repo.state?.workingTreeChanges ?? []).map((c: any) => toUiChange(repo, c, false));
+  const unstagedMerge = (repo.state?.mergeChanges ?? []).map((c: any) => toUiChange(repo, c, false));
+  const unstaged = dedupeByFull([...unstagedWT, ...unstagedMerge]);
+
   log(`collectState: staged=${staged.length}, unstaged=${unstaged.length}, root=${repo.rootUri.fsPath}`);
   return { staged, unstaged };
 }
@@ -127,6 +233,8 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('pushGo.commit', () => handlers.commitCommand()),
     vscode.commands.registerCommand('pushGo.commitPush', () => handlers.commitPushCommand()),
   );
+  // לא חוסם, רק מזכיר אם Git לא זמין
+  void ensureGitAvailable();
 }
 
 export function deactivate() {}
@@ -146,13 +254,14 @@ class PushGoViewProvider implements vscode.WebviewViewProvider {
     webview.html = getHtml();
 
     const post = (e: any) => webview.postMessage(e);
-    const pushState = async () => post({ type: 'state', state: await collectState() });
+    const pushStateNow = async () => post({ type: 'state', state: await collectState() });
+    const pushState = debounce(() => void pushStateNow(), 150);
 
     // מסרים מה־UI
     webview.onDidReceiveMessage(async (m: any) => {
       try {
         await (handlers[m?.type] ?? (async () => {}))(m);
-        if (m?.type !== 'requestState') { await pushState(); post({ type: 'ok', action: m?.type }); }
+        if (m?.type !== 'requestState') { await pushStateNow(); post({ type: 'ok', action: m?.type }); }
       } catch (err: any) {
         const msg = err?.message ?? String(err);
         vscode.window.showErrorMessage(`Push&Go: ${msg}`);
@@ -167,14 +276,18 @@ class PushGoViewProvider implements vscode.WebviewViewProvider {
 
       const subs: vscode.Disposable[] = [];
       if (repo?.state?.onDidChange) subs.push(repo.state.onDidChange(() => void pushState()));
+      if ((repo as any)?.onDidRunOperation) subs.push((repo as any).onDidRunOperation(() => void pushState()));
       if (api?.onDidOpenRepository) subs.push(api.onDidOpenRepository(() => void pushState()));
       if (api?.onDidCloseRepository) subs.push(api.onDidCloseRepository(() => void pushState()));
       subs.push(vscode.window.onDidChangeActiveTextEditor(() => void pushState()));
       subs.push(vscode.workspace.onDidSaveTextDocument(() => void pushState()));
+      subs.push(vscode.workspace.onDidCreateFiles(() => void pushState()));
+      subs.push(vscode.workspace.onDidDeleteFiles(() => void pushState()));
+      subs.push(vscode.workspace.onDidRenameFiles(() => void pushState()));
       this.ctx.subscriptions.push(...subs);
 
       // שליחה ראשונית + עדכון ידני
-      setTimeout(() => void pushState(), 0);
+      setTimeout(() => void pushStateNow(), 0);
     })();
   }
 }
@@ -240,9 +353,11 @@ body{ margin:0; color:var(--fg); background:var(--bg); font: normal var(--fs-12)
 .btn:hover{ filter:brightness(1.05); }
 .btn.primary{ background:var(--accent); color:var(--accent-ctrl); border-color:transparent; font-weight:600; }
 .btn.sm{ height:20px; padding:0 6px; font-size:var(--fs-11); color:var(--muted); }
+.btn[disabled]{ opacity:.6; cursor:not-allowed; }
 
 /* footer */
 .ftr{ position:sticky; bottom:0; border-top:1px solid var(--border); padding:8px 10px; background:var(--bg); }
+.status{ font-size:var(--fs-11); min-height:14px; margin-bottom:6px; color:var(--muted); }
 .btns{ display:flex; gap:8px; flex-wrap:wrap; }
 textarea{
   width:100%; min-height:64px; max-height:140px; resize:vertical;
@@ -274,6 +389,7 @@ textarea{
     </div>
 
     <div class="ftr">
+      <div id="status" class="status" aria-live="polite"></div>
       <div class="btns">
         <button class="btn" data-action="commit">Commit</button>
         <button class="btn" data-action="push">Push</button>
@@ -287,7 +403,10 @@ textarea{
 <script>
 const vscode = acquireVsCodeApi();
 const $ = (s, r=document) => r.querySelector(s);
+const $$ = (s, r=document) => Array.from(r.querySelectorAll(s));
 const post = (type, payload={}) => vscode.postMessage({ type, ...payload });
+
+const short = (s) => String(s||'').split('\\n')[0].slice(0, 180);
 
 const makeRow = (item) => {
   const el = document.createElement('div');
@@ -320,9 +439,34 @@ function render(state){
   counts.textContent = \`\${staged.length} staged · \${unstaged.length} unstaged\`;
 }
 
+const statusEl = $('#status');
+const toast = (txt) => {
+  statusEl.textContent = txt || '';
+  if(!txt) return;
+  clearTimeout(statusEl._t);
+  statusEl._t = setTimeout(() => { statusEl.textContent=''; }, 2500);
+};
+
+const msgEl = $('#msg');
+const restore = vscode.getState?.() || {};
+if (restore.msg) msgEl.value = restore.msg;
+
+const setCommitButtons = () => {
+  const enabled = !!msgEl.value.trim();
+  $$('.btn[data-action="commit"], .btn[data-action="commitPush"]').forEach(b => b.disabled = !enabled);
+};
+setCommitButtons();
+
+msgEl.addEventListener('input', () => {
+  const next = { ...(vscode.getState?.() || {}), msg: msgEl.value };
+  vscode.setState?.(next);
+  setCommitButtons();
+});
+
 document.addEventListener('click', (e) => {
   const a = e.target.closest('[data-action]');
   if(!a) return;
+  if (a.hasAttribute('disabled')) return; // אל תלחץ כפתור נעול
   e.preventDefault();
   const act = a.getAttribute('data-action');
   ({
@@ -330,9 +474,9 @@ document.addEventListener('click', (e) => {
     stageAll:   () => post('stageAll'),
     unstageAll: () => post('unstageAll'),
     discardAll: () => post('discardAll'),
-    commit:     () => post('commit', { message: $('#msg').value }),
+    commit:     () => post('commit', { message: msgEl.value }),
     push:       () => post('push'),
-    commitPush: () => post('commitPush', { message: $('#msg').value }),
+    commitPush: () => post('commitPush', { message: msgEl.value }),
     discard:    () => post('discard', { path: a.getAttribute('data-path') }),
     openDiff:   () => post('openDiff', { path: a.getAttribute('data-path') }),
   }[act] || (()=>{}))();
@@ -347,7 +491,11 @@ document.addEventListener('change', (e) => {
 
 window.addEventListener('message', (ev) => {
   const m = ev.data;
-  ({ state: () => render(m.state) }[m.type] || (()=>{}))();
+  ({
+    state: () => render(m.state),
+    ok:    () => toast('✔ ' + (m.action || 'Done')),
+    error: () => toast('✖ ' + short(m.message))
+  }[m.type] || (()=>{}))();
 });
 
 post('requestState');
@@ -359,7 +507,7 @@ post('requestState');
 
 /* =============== Handlers =============== */
 
-// המיפוי נשאר עם פרמטר אופציונלי כדי לאפשר קריאות בלי ארגומנט
+// פרמטר אופציונלי כדי לאפשר קריאות בלי ארגומנט
 const handlers: Record<string, (m?: any) => Promise<void>> = {
   requestState: async () => { /* handled per-view */ },
 
@@ -370,15 +518,33 @@ const handlers: Record<string, (m?: any) => Promise<void>> = {
   },
   unstageAll: async () => {
     const api = await ensureGitApi(); const repo = bestRepo(api) ?? await waitForRepo(); if (!repo) return;
-    await runGit(['reset', '-q', 'HEAD', '--', '.'], repo.rootUri.fsPath);
+    if (await hasHead(repo.rootUri.fsPath)) {
+      await runGit(['reset', '-q', 'HEAD', '--', '.'], repo.rootUri.fsPath);
+    } else {
+      await runGit(['rm', '--cached', '-r', '.'], repo.rootUri.fsPath);
+    }
   },
   discardAll: async () => {
     const api = await ensureGitApi(); const repo = bestRepo(api) ?? await waitForRepo(); if (!repo) return;
-    const confirm = await vscode.window.showWarningMessage('Discard ALL local changes? This cannot be undone.', { modal: true }, 'Discard');
-    if (confirm !== 'Discard') return;
-    try { await runGit(['restore', '--worktree', '--staged', '--source=HEAD', '.'], repo.rootUri.fsPath); }
-    catch { await runGit(['checkout', '--', '.'], repo.rootUri.fsPath); }
-    await runGit(['clean', '-fd'], repo.rootUri.fsPath);
+
+    if (await hasHead(repo.rootUri.fsPath)) {
+      const confirm = await vscode.window.showWarningMessage(
+        'Discard ALL local changes? This cannot be undone.',
+        { modal: true }, 'Discard'
+      );
+      if (confirm !== 'Discard') return;
+      try { await runGit(['restore', '--worktree', '--staged', '--source=HEAD', '.'], repo.rootUri.fsPath); }
+      catch { await runGit(['checkout', '--', '.'], repo.rootUri.fsPath); }
+      await runGit(['clean', '-fd'], repo.rootUri.fsPath);
+    } else {
+      const confirm = await vscode.window.showWarningMessage(
+        'No commits yet. Discard All will remove ALL untracked files from disk. Continue?',
+        { modal: true }, 'Discard'
+      );
+      if (confirm !== 'Discard') return;
+      try { await runGit(['rm', '--cached', '-r', '.'], repo.rootUri.fsPath); } catch {}
+      await runGit(['clean', '-fd'], repo.rootUri.fsPath);
+    }
   },
 
   /* Per file */
@@ -388,39 +554,50 @@ const handlers: Record<string, (m?: any) => Promise<void>> = {
   },
   unstageFile: async (m) => {
     const api = await ensureGitApi(); const repo = bestRepo(api) ?? await waitForRepo(); if (!repo) return;
-    await runGit(['reset', '-q', 'HEAD', '--', m.path], repo.rootUri.fsPath);
+    if (await hasHead(repo.rootUri.fsPath)) {
+      await runGit(['reset', '-q', 'HEAD', '--', m.path], repo.rootUri.fsPath);
+    } else {
+      await runGit(['rm', '--cached', '--', m.path], repo.rootUri.fsPath);
+    }
   },
   discard: async (m) => {
     const api = await ensureGitApi(); const repo = bestRepo(api) ?? await waitForRepo(); if (!repo) return;
-    const isUntracked = !!(await runGit(['ls-files', '--others', '--exclude-standard', '--', m.path], repo.rootUri.fsPath)).trim();
-    if (isUntracked) await runGit(['clean', '-f', '--', m.path], repo.rootUri.fsPath);
-    else {
-      try { await runGit(['restore', '--worktree', '--staged', '--source=HEAD', '--', m.path], repo.rootUri.fsPath); }
-      catch { await runGit(['checkout', '--', m.path], repo.rootUri.fsPath); }
+    if (await hasHead(repo.rootUri.fsPath)) {
+      const isUntracked = !!(await runGit(['ls-files', '--others', '--exclude-standard', '--', m.path], repo.rootUri.fsPath)).trim();
+      if (isUntracked) await runGit(['clean', '-f', '--', m.path], repo.rootUri.fsPath);
+      else {
+        try { await runGit(['restore', '--worktree', '--staged', '--source=HEAD', '--', m.path], repo.rootUri.fsPath); }
+        catch { await runGit(['checkout', '--', m.path], repo.rootUri.fsPath); }
+      }
+    } else {
+      try { await runGit(['rm', '--cached', '--', m.path], repo.rootUri.fsPath); } catch {}
+      await runGit(['clean', '-f', '--', m.path], repo.rootUri.fsPath);
     }
   },
 
   openDiff: async (m) => {
     const api = await ensureGitApi(); const repo = bestRepo(api) ?? await waitForRepo(); if (!repo) return;
 
-    // בונים את ה-URI של הקובץ הנוכחי
     const abs = path.join(repo.rootUri.fsPath, m.path);
     const fileUri = vscode.Uri.file(abs);
 
-    // מחפשים את ה-change כדי לזהות rename (אם יש)
+    if (!(await hasHead(repo.rootUri.fsPath))) {
+      await vscode.commands.executeCommand('vscode.open', fileUri);
+      return;
+    }
+
     const all = [
       ...(repo.state?.indexChanges ?? []),
       ...(repo.state?.workingTreeChanges ?? []),
       ...(repo.state?.mergeChanges ?? []),
     ];
     const changeForFile = all.find((c: any) => c?.uri?.fsPath === fileUri.fsPath);
-    const leftFsPath = changeForFile?.renameUri?.fsPath ?? fileUri.fsPath; // אם rename – נשתמש בישן
+    const leftFsPath = changeForFile?.renameUri?.fsPath ?? fileUri.fsPath;
 
-    // git:URI תקין לפי הפורמט של Git provider (query כ-JSON עם path+ref)
     const left = vscode.Uri.from({
       scheme: 'git',
-      path: vscode.Uri.file(leftFsPath).path, // לשם/תצוגה
-      query: JSON.stringify({ path: leftFsPath, ref: 'HEAD' }), // לשחזור התוכן מ-HEAD
+      path: vscode.Uri.file(leftFsPath).path,
+      query: JSON.stringify({ path: leftFsPath, ref: 'HEAD' }),
     });
 
     const title =
@@ -434,31 +611,83 @@ const handlers: Record<string, (m?: any) => Promise<void>> = {
   /* Commit / Push */
   commit: async (m) => {
     const api = await ensureGitApi(); const repo = bestRepo(api) ?? await waitForRepo(); if (!repo) return;
+    const cwd = repo.rootUri.fsPath;
+
     const message = String(m?.message ?? '').trim();
     if (!message) throw new Error('Commit message is required.');
+
+    // Dedicated check: no staged → friendly error
+    const staged = await getStagedFiles(cwd);
+    if (staged.length === 0) throw new Error('No staged changes. Stage files first.');
 
     const cfg = vscode.workspace.getConfiguration();
     if (cfg.get<boolean>(SETTINGS.wipGuard) && /(^|\s)wip(\s|$)/i.test(message)) {
       throw new Error(`WIP is blocked by settings (${SETTINGS.wipGuard}).`);
     }
     if (cfg.get<boolean>(SETTINGS.blockOnMain)) {
-      const b = await getBranch(repo.rootUri.fsPath);
+      const b = await getBranch(cwd);
       if (['main', 'master'].includes(b)) {
         const ok = await vscode.window.showWarningMessage(`Commit on "${b}"?`, { modal: true }, 'Commit');
         if (ok !== 'Commit') return;
       }
     }
-    await runGit(['commit', '-m', message, '--no-gpg-sign'], repo.rootUri.fsPath);
+    await runGit(['commit', '-m', message, '--no-gpg-sign'], cwd);
   },
 
   push: async () => {
     const api = await ensureGitApi(); const repo = bestRepo(api) ?? await waitForRepo(); if (!repo) return;
-    try { await runGit(['push'], repo.rootUri.fsPath); }
-    catch (e: any) {
-      if (/no upstream branch/i.test(String(e?.message ?? ''))) {
-        const branch = await getBranch(repo.rootUri.fsPath);
-        await runGit(['push', '-u', 'origin', branch], repo.rootUri.fsPath);
-      } else { throw e; }
+    const cwd = repo.rootUri.fsPath;
+
+    // No commits yet?
+    if (!(await hasHead(cwd))) {
+      vscode.window.showInformationMessage('Push&Go: No commits yet. Create a commit first.');
+      return;
+    }
+
+    const branch = (await getBranch(cwd)) || 'HEAD';
+    const noUpstreamRegex = /\bno upstream\b|has no upstream|no configured push destination|set the remote as upstream/i;
+
+    const runWithProgress = <T>(title: string, task: () => Promise<T>) =>
+      vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title }, task);
+
+    const doPlainPush = async () => {
+      // If we have upstream and nothing to push → say so and bail.
+      const ahead = await countAhead(cwd);
+      if (ahead !== null && ahead === 0) {
+        vscode.window.showInformationMessage('Push&Go: Nothing to push — already up to date.');
+        return;
+      }
+      log(`push: git push in ${cwd}`);
+      await runGit(['push'], cwd);
+      vscode.window.showInformationMessage('Push&Go: Pushed successfully.');
+    };
+
+    const doPushWithUpstream = async () => {
+      // If no upstream, we may still be on the first commit or just missing tracking.
+      const rem = await pickOrCreateRemote(cwd);
+      if (!rem) { vscode.window.showInformationMessage('Push&Go: Push canceled.'); return; }
+      log(`push: git push -u ${rem} ${branch} in ${cwd}`);
+      await runGit(['push', '-u', rem, branch], cwd);
+      vscode.window.showInformationMessage(`Push&Go: Pushed to ${rem}/${branch} (upstream set).`);
+    };
+
+    try {
+      await runWithProgress('Push&Go: Pushing…', async () => {
+        try {
+          await doPlainPush();
+        } catch (e: any) {
+          const msg = String(e?.message ?? '');
+          if (noUpstreamRegex.test(msg) || /does not appear to be a git repository/i.test(msg)) {
+            await doPushWithUpstream();
+          } else {
+            throw e;
+          }
+        }
+      });
+    } catch (e: any) {
+      const msg = (e?.message ?? 'Unknown error').toString().split('\n').slice(0, 6).join('\n');
+      vscode.window.showErrorMessage(`Push&Go: Push failed.\n${msg}`);
+      log('push error:', msg);
     }
   },
 

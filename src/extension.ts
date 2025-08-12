@@ -359,8 +359,14 @@ function getHtml() {
 body{ margin:0; color:var(--fg); background:var(--bg); font: normal var(--fs-12)/1.4 var(--font); }
 .wrap{ display:grid; grid-template-rows:auto auto 1fr auto; height:100%; }
 .countsRow{ padding:8px 10px 4px; border-bottom:1px solid var(--border); color:var(--muted); }
-.actions{ padding:4px 10px 8px; border-bottom:1px solid var(--border); display:flex; flex-direction:column; gap:6px; }
-.link{ text-decoration:none; color:var(--fg); opacity:.9; font-size:var(--fs-11); }
+.actions{
+  padding:6px 10px 8px;
+  border-bottom:1px solid var(--border);
+  display:flex;
+  gap:6px;
+  flex-wrap:wrap;
+  align-items:center;
+}.link{ text-decoration:none; color:var(--fg); opacity:.9; font-size:var(--fs-11); }
 .link:hover{ text-decoration:underline; }
 .main{ overflow:auto; padding:10px; }
 .group{ margin-top: 6px; }
@@ -382,9 +388,38 @@ body{ margin:0; color:var(--fg); background:var(--bg); font: normal var(--fs-12)
   border:1px solid var(--border); background:transparent; color:var(--fg);
   font-size:var(--fs-12); cursor:pointer;
 }
-.btn:hover{ filter:brightness(1.05); }
+.btn:hover {
+  background: color-mix(in oklab, var(--panel) 88%, transparent);
+  border-color: color-mix(in oklab, var(--border) 60%, var(--fg) 40%);
+  transition: background 0.15s ease, border-color 0.15s ease, transform 0.05s ease;
+}
 .btn.primary{ background:var(--accent); color:var(--accent-ctrl); border-color:transparent; font-weight:600; }
 .btn.sm{ height:20px; padding:0 6px; font-size:var(--fs-11); color:var(--muted); }
+.btn.xs{
+  height:20px;
+  padding:0 8px;
+  font-size:var(--fs-11);
+}
+.btn.ghost{
+  background:transparent;
+  color: var(--vscode-foreground);
+  border-color: var(--border);
+}
+  /* Hover effect */
+.btn:hover {
+  background: color-mix(in oklab, var(--panel) 88%, transparent);
+  border-color: color-mix(in oklab, var(--border) 60%, var(--fg) 40%);
+}
+
+/* Clicked/pressed effect */
+.btn:active {
+  background: color-mix(in oklab, var(--panel) 75%, transparent);
+  border-color: var(--accent);
+  color: var(--accent-ctrl);
+  transform: translateY(1px) scale(0.98);
+  transition: none; /* instant feedback */
+}
+
 
 /* tiny icon button for Discard */
 .iconbtn{
@@ -412,12 +447,11 @@ textarea{
 <body>
   <div class="wrap">
     <div class="countsRow"><span id="counts">0 staged · 0 unstaged</span></div>
-    <div class="actions">
-      <a class="link" href="#" data-action="stageAll">Stage All</a>
-      <a class="link" href="#" data-action="unstageAll">Unstage All</a>
-      <a class="link" href="#" data-action="discardAll">Discard All</a>
-      <a class="link" href="#" data-action="refresh">Refresh</a>
-    </div>
+<div class="actions" role="toolbar" aria-label="Changes actions">
+  <button class="btn xs ghost" data-action="stageAll">Stage All</button>
+  <button class="btn xs ghost" data-action="unstageAll">Unstage All</button>
+  <button class="btn xs ghost" data-action="discardAll">Discard All</button>
+</div>
 
     <div class="main">
       <div class="group">

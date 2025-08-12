@@ -91,7 +91,7 @@ async function ensureGitAvailable(): Promise<boolean> {
   }
 }
 
-/* ---- NEW: precise state helpers ---- */
+/* ---- precise state helpers ---- */
 async function getStagedFiles(cwd: string): Promise<string[]> {
   try {
     const s = await runGit(['diff', '--cached', '--name-only'], cwd);
@@ -353,7 +353,17 @@ body{ margin:0; color:var(--fg); background:var(--bg); font: normal var(--fs-12)
 .btn:hover{ filter:brightness(1.05); }
 .btn.primary{ background:var(--accent); color:var(--accent-ctrl); border-color:transparent; font-weight:600; }
 .btn.sm{ height:20px; padding:0 6px; font-size:var(--fs-11); color:var(--muted); }
-.btn[disabled]{ opacity:.6; cursor:not-allowed; }
+
+/* NEW: tiny icon button for Discard */
+.iconbtn{
+  width:18px; height:18px; border-radius:4px;
+  border:1px solid transparent; background:transparent; color:var(--muted);
+  display:inline-grid; place-items:center; padding:0; cursor:pointer;
+  opacity:.75; transition:opacity .15s, background .15s, border-color .15s, color .15s;
+}
+.iconbtn svg{ width:13px; height:13px; stroke:currentColor; fill:none; stroke-width:1.6; }
+.row:hover .iconbtn{ opacity:.95; border-color:var(--border); background: color-mix(in oklab, var(--panel) 85%, transparent); color:var(--fg); }
+.iconbtn:hover{ opacity:1; }
 
 /* footer */
 .ftr{ position:sticky; bottom:0; border-top:1px solid var(--border); padding:8px 10px; background:var(--bg); }
@@ -415,7 +425,12 @@ const makeRow = (item) => {
     <input class="chk" type="checkbox" \${item.staged ? 'checked' : ''} data-path="\${item.path}" aria-label="stage-toggle" />
     <div class="name" title="\${item.full}" data-action="openDiff" data-path="\${item.path}">\${item.path}</div>
     <span class="badge">\${item.status}</span>
-    <button class="btn sm" data-action="discard" data-path="\${item.path}">Discard</button>
+    <button class="iconbtn" title="Discard changes" aria-label="Discard" data-action="discard" data-path="\${item.path}">
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M4 7h16M9 7v-2a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2M7 7l1 12a2 2 0 0 0 2 2h4a2 2 0 0 0 2-2l1-12"/>
+        <path d="M10 11v6M14 11v6"/>
+      </svg>
+    </button>
   \`;
   return el;
 };
@@ -616,7 +631,7 @@ const handlers: Record<string, (m?: any) => Promise<void>> = {
     const message = String(m?.message ?? '').trim();
     if (!message) throw new Error('Commit message is required.');
 
-    // Dedicated check: no staged → friendly error
+    // No staged → הודעה ידידותית
     const staged = await getStagedFiles(cwd);
     if (staged.length === 0) throw new Error('No staged changes. Stage files first.');
 
@@ -651,7 +666,7 @@ const handlers: Record<string, (m?: any) => Promise<void>> = {
       vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title }, task);
 
     const doPlainPush = async () => {
-      // If we have upstream and nothing to push → say so and bail.
+      // אם יש upstream ואנחנו לא ahead → אין מה לדחוף
       const ahead = await countAhead(cwd);
       if (ahead !== null && ahead === 0) {
         vscode.window.showInformationMessage('Push&Go: Nothing to push — already up to date.');
@@ -663,7 +678,6 @@ const handlers: Record<string, (m?: any) => Promise<void>> = {
     };
 
     const doPushWithUpstream = async () => {
-      // If no upstream, we may still be on the first commit or just missing tracking.
       const rem = await pickOrCreateRemote(cwd);
       if (!rem) { vscode.window.showInformationMessage('Push&Go: Push canceled.'); return; }
       log(`push: git push -u ${rem} ${branch} in ${cwd}`);

@@ -810,7 +810,6 @@ const applyCollapseUI = () => {
 applyCollapseUI();
 
 
-
 const setCommitButtons = () => {
   const enabled = !!$msg.value.trim();
   $$('.btn[data-action="commit"], .btn[data-action="commitPush"]').forEach(b => b.disabled = !enabled);

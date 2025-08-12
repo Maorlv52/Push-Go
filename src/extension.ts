@@ -6,6 +6,7 @@ import * as path from 'path';
 /* =============== Git bootstrap =============== */
 
 let gitApi: any | undefined;
+let ctxGlobal: vscode.ExtensionContext | undefined;
 
 async function ensureGitApi(): Promise<any | undefined> {
   if (gitApi) return gitApi;
@@ -21,14 +22,12 @@ async function ensureGitApi(): Promise<any | undefined> {
 async function getUpstream(cwd: string): Promise<{ remote: string; branch: string } | null> {
   try {
     const s = await runGit(['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'], cwd);
-    // e.g. "origin/dev"
     const [remote, ...rest] = s.split('/');
     const branch = rest.join('/');
     if (!remote || !branch) return null;
     return { remote, branch };
   } catch { return null; }
 }
-
 
 async function waitForRepo(timeoutMs = 2500): Promise<any | undefined> {
   const api = await ensureGitApi();
@@ -119,6 +118,26 @@ class Debouncer {
   cancel() { if (this.t) { clearTimeout(this.t); this.t = null; } }
 }
 
+/* ===== Ignored (local) helpers ===== */
+function ignoredKey(cwd: string) { return `pushGo.ignored:${cwd}`; }
+async function getIgnoredSet(cwd: string): Promise<Set<string>> {
+  const arr = ctxGlobal?.workspaceState.get<string[]>(ignoredKey(cwd)) ?? [];
+  return new Set(arr);
+}
+async function saveIgnoredSet(cwd: string, set: Set<string>) {
+  await ctxGlobal?.workspaceState.update(ignoredKey(cwd), Array.from(set).sort());
+}
+async function addIgnored(cwd: string, paths: string[]) {
+  const set = await getIgnoredSet(cwd);
+  for (const p of paths) set.add(p);
+  await saveIgnoredSet(cwd, set);
+}
+async function removeIgnored(cwd: string, paths: string[]) {
+  const set = await getIgnoredSet(cwd);
+  for (const p of paths) set.delete(p);
+  await saveIgnoredSet(cwd, set);
+}
+
 /* remotes helpers */
 async function listRemotes(cwd: string): Promise<string[]> {
   try {
@@ -174,7 +193,7 @@ type UiChange = {
   status: 'M' | 'A' | 'D' | 'R' | 'U' | '??';
   staged: boolean;
 };
-type UiState = { staged: UiChange[]; unstaged: UiChange[] };
+type UiState = { staged: UiChange[]; unstaged: UiChange[]; ignored: UiChange[] };
 
 const mapStatus = (s: any, c: any): UiChange['status'] => {
   const t = String(s ?? '');
@@ -207,16 +226,26 @@ async function collectState(): Promise<UiState> {
   const repo = bestRepo(api) ?? await waitForRepo();
   if (!repo) {
     log('collectState: no repo yet');
-    return { staged: [], unstaged: [] };
+    return { staged: [], unstaged: [], ignored: [] };
   }
 
   const staged = (repo.state?.indexChanges ?? []).map((c: any) => toUiChange(repo, c, true));
   const unstagedWT = (repo.state?.workingTreeChanges ?? []).map((c: any) => toUiChange(repo, c, false));
   const unstagedMerge = (repo.state?.mergeChanges ?? []).map((c: any) => toUiChange(repo, c, false));
-  const unstaged = dedupeByFull([...unstagedWT, ...unstagedMerge]);
+  let unstaged = dedupeByFull([...unstagedWT, ...unstagedMerge]);
 
-  log(`collectState: staged=${staged.length}, unstaged=${unstaged.length}, root=${repo.rootUri.fsPath}`);
-  return { staged, unstaged };
+  const cwd = repo.rootUri.fsPath;
+  const ignoredSet = await getIgnoredSet(cwd);
+
+  const all = [...staged, ...unstaged];
+  const ignored = all.filter(i => ignoredSet.has(i.path)).map(i => ({ ...i, staged: false }));
+  const ignoredPaths = new Set(ignored.map(i => i.path));
+
+  const stagedF = staged.filter((i: any) => !ignoredPaths.has(i.path));
+  const unstagedF = unstaged.filter(i => !ignoredPaths.has(i.path));
+
+  log(`collectState: staged=${stagedF.length}, unstaged=${unstagedF.length}, ignored=${ignored.length}, root=${cwd}`);
+  return { staged: stagedF, unstaged: unstagedF, ignored };
 }
 
 /* =============== Global UI messaging =============== */
@@ -231,6 +260,7 @@ let _endBatch: () => Promise<void> = async () => { };
 /* =============== Extension entry =============== */
 
 export function activate(context: vscode.ExtensionContext) {
+  ctxGlobal = context; // store for workspaceState
   out.show(true);
   const provider = new PushGoViewProvider(context);
   context.subscriptions.push(
@@ -366,7 +396,8 @@ body{ margin:0; color:var(--fg); background:var(--bg); font: normal var(--fs-12)
   gap:6px;
   flex-wrap:wrap;
   align-items:center;
-}.link{ text-decoration:none; color:var(--fg); opacity:.9; font-size:var(--fs-11); }
+}
+.link{ text-decoration:none; color:var(--fg); opacity:.9; font-size:var(--fs-11); }
 .link:hover{ text-decoration:underline; }
 .main{ overflow:auto; padding:10px; }
 .group{ margin-top: 6px; }
@@ -374,7 +405,8 @@ body{ margin:0; color:var(--fg); background:var(--bg); font: normal var(--fs-12)
 .empty{ color:var(--muted); font-style:italic; padding:6px 0 8px; }
 .list{ display:flex; flex-direction:column; gap:2px; }
 .row{
-  display:grid; grid-template-columns:18px 1fr auto auto; align-items:center;
+  display:grid; grid-template-columns:18px 1fr auto auto auto;
+  align-items:center;
   min-height:var(--row-h); border-radius:var(--radius); padding:0 6px; border:1px solid transparent;
 }
 .row:hover{ background: color-mix(in oklab, var(--panel) 70%, transparent); border-color:var(--border); }
@@ -395,21 +427,8 @@ body{ margin:0; color:var(--fg); background:var(--bg); font: normal var(--fs-12)
 }
 .btn.primary{ background:var(--accent); color:var(--accent-ctrl); border-color:transparent; font-weight:600; }
 .btn.sm{ height:20px; padding:0 6px; font-size:var(--fs-11); color:var(--muted); }
-.btn.xs{
-  height:20px;
-  padding:0 8px;
-  font-size:var(--fs-11);
-}
-.btn.ghost{
-  background:transparent;
-  color: var(--vscode-foreground);
-  border-color: var(--border);
-}
-  /* Hover effect */
-.btn:hover {
-  background: color-mix(in oklab, var(--panel) 88%, transparent);
-  border-color: color-mix(in oklab, var(--border) 60%, var(--fg) 40%);
-}
+.btn.xs{ height:20px; padding:0 8px; font-size:var(--fs-11); }
+.btn.ghost{ background:transparent; color: var(--vscode-foreground); border-color: var(--border); }
 
 /* Clicked/pressed effect */
 .btn:active {
@@ -417,11 +436,10 @@ body{ margin:0; color:var(--fg); background:var(--bg); font: normal var(--fs-12)
   border-color: var(--accent);
   color: var(--accent-ctrl);
   transform: translateY(1px) scale(0.98);
-  transition: none; /* instant feedback */
+  transition: none;
 }
 
-
-/* tiny icon button for Discard */
+/* tiny icon buttons */
 .iconbtn{
   width:18px; height:18px; border-radius:4px;
   border:1px solid transparent; background:transparent; color:var(--muted);
@@ -447,11 +465,12 @@ textarea{
 <body>
   <div class="wrap">
     <div class="countsRow"><span id="counts">0 staged · 0 unstaged</span></div>
-<div class="actions" role="toolbar" aria-label="Changes actions">
-  <button class="btn xs ghost" data-action="stageAll">Stage All</button>
-  <button class="btn xs ghost" data-action="unstageAll">Unstage All</button>
-  <button class="btn xs ghost" data-action="discardAll">Discard All</button>
-</div>
+
+    <div class="actions" role="toolbar" aria-label="Changes actions">
+      <button class="btn xs ghost" data-action="stageAll">Stage All</button>
+      <button class="btn xs ghost" data-action="unstageAll">Unstage All</button>
+      <button class="btn xs ghost" data-action="discardAll">Discard All</button>
+    </div>
 
     <div class="main">
       <div class="group">
@@ -461,6 +480,10 @@ textarea{
       <div class="group">
         <div class="ttl">Unstaged <span id="unstagedCount" style="color:var(--muted)"></span></div>
         <div id="unstagedList" class="list"><div class="empty">No files</div></div>
+      </div>
+      <div class="group">
+        <div class="ttl">Ignored (local) <span id="ignoredCount" style="color:var(--muted)"></span></div>
+        <div id="ignoredList" class="list"><div class="empty">No files</div></div>
       </div>
     </div>
 
@@ -483,13 +506,18 @@ const $$ = (s, r=document) => Array.from(r.querySelectorAll(s));
 const post = (type, payload={}) => vscode.postMessage({ type, ...payload });
 const short = (s) => String(s||'').split('\\n')[0].slice(0, 180);
 
-let state = { staged: [], unstaged: [] };
+let state = { staged: [], unstaged: [], ignored: [] };
 let lastSeq = 0;
 
 /* ===== overlay for in-flight ops (prevents vanish) ===== */
-const overlay = new Map(); // path -> { dest: 'staged'|'unstaged'|'none', item?: any }
+const overlay = new Map(); // path -> { dest: 'staged'|'unstaged'|'ignored'|'none', item?: any }
 const pendingByAction = new Map(); // action -> Array<Array<path>>
-const opToDest = (op) => op.startsWith('stage') ? 'staged' : op.startsWith('unstage') ? 'unstaged' : 'none';
+const opToDest = (op) =>
+  op.startsWith('stage') ? 'staged'
+  : op.startsWith('unstage') ? 'unstaged'
+  : op.startsWith('ignore') ? 'ignored'
+  : op.startsWith('unignore') ? 'unstaged'
+  : 'none';
 const pushPending = (action, paths) => {
   const arr = pendingByAction.get(action) || [];
   arr.push(paths);
@@ -507,6 +535,7 @@ const snapshot = new Map(); // path -> item
 function updateSnapshot(s){
   for(const i of (s.staged||[]))   snapshot.set(i.path, i);
   for(const i of (s.unstaged||[])) snapshot.set(i.path, i);
+  for(const i of (s.ignored||[]))  snapshot.set(i.path, i);
 }
 
 /* === equality check === */
@@ -514,20 +543,30 @@ const _norm = (arr=[]) => arr.map(i=>({full:i.full, path:i.path, status:i.status
   .sort((a,b)=> a.full.localeCompare(b.full) || (a.staged===b.staged?0:(a.staged?1:-1)) || a.status.localeCompare(b.status));
 function equalState(a, b){
   if(!a||!b) return false;
-  const as=_norm(a.staged), au=_norm(a.unstaged), bs=_norm(b.staged), bu=_norm(b.unstaged);
-  if(as.length!==bs.length || au.length!==bu.length) return false;
+  const as=_norm(a.staged), au=_norm(a.unstaged), ai=_norm(a.ignored||[]);
+  const bs=_norm(b.staged), bu=_norm(b.unstaged), bi=_norm((b.ignored)||[]);
+  if(as.length!==bs.length || au.length!==bu.length || ai.length!==bi.length) return false;
   for(let i=0;i<as.length;i++){ const x=as[i], y=bs[i]; if(x.full!==y.full||x.staged!==y.staged||x.status!==y.status) return false; }
   for(let i=0;i<au.length;i++){ const x=au[i], y=bu[i]; if(x.full!==y.full||x.staged!==y.staged||x.status!==y.status) return false; }
+  for(let i=0;i<ai.length;i++){ const x=ai[i], y=bi[i]; if(x.full!==y.full||x.staged!==y.staged||x.status!==y.status) return false; }
   return true;
 }
 
-const makeRow = (item) => {
+const makeRow = (item, inIgnored=false) => {
   const el = document.createElement('div');
   el.className = 'row';
   el.innerHTML = \`
     <input class="chk" type="checkbox" \${item.staged ? 'checked' : ''} data-path="\${item.path}" aria-label="stage-toggle" />
     <div class="name" title="\${item.full}" data-action="openDiff" data-path="\${item.path}">\${item.path}</div>
     <span class="badge">\${item.status}</span>
+    <button class="iconbtn" title="\${inIgnored ? 'Unignore' : 'Ignore'}" aria-label="\${inIgnored ? 'Unignore' : 'Ignore'}"
+      data-action="\${inIgnored ? 'unignore' : 'ignore'}" data-path="\${item.path}">
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <!-- eye-off icon -->
+        <path d="M3 3l18 18"/><path d="M10.58 10.58a2 2 0 1 0 2.84 2.84"/>
+        <path d="M9.88 4.24A10.94 10.94 0 0 1 12 4c5 0 9 4 10 6- .3.6-1.21 2.08-2.93 3.58"/>
+      </svg>
+    </button>
     <button class="iconbtn" title="Discard changes" aria-label="Discard" data-action="discard" data-path="\${item.path}">
       <svg viewBox="0 0 24 24" aria-hidden="true">
         <path d="M4 7h16M9 7v-2a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2M7 7l1 12a2 2 0 0 0 2 2h4a2 2 0 0 0 2-2l1-12"/>
@@ -543,25 +582,26 @@ function applyOverlay(s){
   const stagedSet = new Set((s.staged||[]).map(i=>i.path));
   s.unstaged = (s.unstaged||[]).filter(i => !stagedSet.has(i.path));
 
-  for(const [p, {dest, item}] of overlay.entries()){
-    if (dest === 'none') {
-      s.staged   = (s.staged||[]).filter(i => i.path !== p);
-      s.unstaged = (s.unstaged||[]).filter(i => i.path !== p);
-      continue;
-    }
-    const found = (s.staged||[]).find(i=>i.path===p) || (s.unstaged||[]).find(i=>i.path===p) || item || snapshot.get(p) || { path:p, full:p, status:'M', staged: dest==='staged' };
-    const normalized = { ...found, staged: dest==='staged' };
-
+  const removeFromAll = (p) => {
     s.staged   = (s.staged||[]).filter(i => i.path !== p);
     s.unstaged = (s.unstaged||[]).filter(i => i.path !== p);
+    s.ignored  = (s.ignored||[]).filter(i => i.path !== p);
+  };
 
-    if (dest === 'staged') {
-      if (!(s.staged||[]).some(i => i.path === p)) s.staged = [...(s.staged||[]), normalized];
-      else s.staged = s.staged.map(i => i.path === p ? normalized : i);
-    } else {
-      if (!(s.unstaged||[]).some(i => i.path === p)) s.unstaged = [...(s.unstaged||[]), normalized];
-      else s.unstaged = s.unstaged.map(i => i.path === p ? normalized : i);
-    }
+  for(const [p, {dest, item}] of overlay.entries()){
+    if (dest === 'none') { removeFromAll(p); continue; }
+
+    const found = (s.staged||[]).find(i=>i.path===p)
+      || (s.unstaged||[]).find(i=>i.path===p)
+      || (s.ignored||[]).find(i=>i.path===p)
+      || item || snapshot.get(p) || { path:p, full:p, status:'M', staged: dest==='staged' };
+
+    const normalized = { ...found, staged: dest==='staged' };
+    removeFromAll(p);
+
+    if (dest === 'staged') s.staged   = [...(s.staged||[]), normalized];
+    else if (dest === 'unstaged') s.unstaged = [...(s.unstaged||[]), { ...normalized, staged:false }];
+    else if (dest === 'ignored') s.ignored  = [...(s.ignored||[]), { ...normalized, staged:false }];
   }
   return s;
 }
@@ -570,19 +610,22 @@ function render(nextState){
   state = nextState || state;
   const staged = state?.staged ?? [];
   const unstaged = state?.unstaged ?? [];
-  const stageList = $('#stagedList'), unList = $('#unstagedList');
-  const sc = $('#stagedCount'), uc = $('#unstagedCount'), counts = $('#counts');
+  const ignored = state?.ignored ?? [];
+  const stageList = $('#stagedList'), unList = $('#unstagedList'), ignList = $('#ignoredList');
+  const sc = $('#stagedCount'), uc = $('#unstagedCount'), ic = $('#ignoredCount'), counts = $('#counts');
 
-  const paint = (node, items) => {
+  const paint = (node, items, inIgnored=false) => {
     node.innerHTML = '';
     if(!items.length){ node.innerHTML = '<div class="empty">No files</div>'; return; }
-    items.forEach(i => node.appendChild(makeRow(i)));
+    items.forEach(i => node.appendChild(makeRow(i, inIgnored)));
   };
 
-  paint(stageList, staged);
-  paint(unList, unstaged);
+  paint(stageList, staged, false);
+  paint(unList, unstaged, false);
+  paint(ignList, ignored, true);
   sc.textContent = staged.length;
   uc.textContent = unstaged.length;
+  ic.textContent = ignored.length;
   counts.textContent = \`\${staged.length} staged · \${unstaged.length} unstaged\`;
 
   updateSnapshot(state);
@@ -592,13 +635,13 @@ window.addEventListener('message', (ev) => {
   const m = ev.data;
   ({
     state: () => {
-      if (m.seq && m.seq < lastSeq) return; // ignore stale
+      if (m.seq && m.seq < lastSeq) return;
       lastSeq = m.seq || lastSeq;
 
-      const incoming = JSON.parse(JSON.stringify(m.state || {staged:[],unstaged:[]}));
+      const incoming = JSON.parse(JSON.stringify(m.state || {staged:[],unstaged:[],ignored:[]}));
       const merged = applyOverlay(incoming);
 
-      if (equalState(state, merged)) return; // skip redundant render
+      if (equalState(state, merged)) return;
       render(merged);
     },
     ok:    () => {
@@ -616,15 +659,29 @@ window.addEventListener('message', (ev) => {
     optimistic: () => {
       const { op, path, paths=[] } = m;
       let list = paths.length ? paths : (path ? [path] : []);
-      if (!list.length && op === 'stageAll')    list = (state.unstaged||[]).map(i=>i.path);
-      if (!list.length && op === 'unstageAll')  list = (state.staged||[]).map(i=>i.path);
-      if (!list.length && op === 'discardAll')  list = [...(state.staged||[]), ...(state.unstaged||[])].map(i=>i.path);
+
+      if (!list.length && op === 'stageAll') {
+        const ignored = new Set((state.ignored||[]).map(i=>i.path));
+        list = (state.unstaged||[]).map(i=>i.path).filter(p => !ignored.has(p));
+      }
+      if (!list.length && op === 'unstageAll') {
+        const ignored = new Set((state.ignored||[]).map(i=>i.path));
+        list = (state.staged||[]).map(i=>i.path).filter(p => !ignored.has(p));
+      }
+      if (!list.length && op === 'discardAll') {
+        const ignored = new Set((state.ignored||[]).map(i=>i.path));
+        list = [...(state.staged||[]), ...(state.unstaged||[])]
+          .map(i=>i.path).filter(p => !ignored.has(p));
+      }
 
       if (list.length) {
         pushPending(op, list);
         const dest = opToDest(op);
         for (const p of list) {
-          const it = (state.staged||[]).find(i=>i.path===p) || (state.unstaged||[]).find(i=>i.path===p) || snapshot.get(p);
+          const it = (state.staged||[]).find(i=>i.path===p)
+                 || (state.unstaged||[]).find(i=>i.path===p)
+                 || (state.ignored||[]).find(i=>i.path===p)
+                 || snapshot.get(p);
           overlay.set(p, { dest, item: it });
         }
       }
@@ -633,13 +690,15 @@ window.addEventListener('message', (ev) => {
         const from = state[fromKey] || []; const to = state[toKey] || [];
         const set = new Set(ps); const moved = []; const remain = [];
         for(const it of from){ if(set.has(it.path)){ moved.push({ ...it, staged: toKey==='staged' }); } else remain.push(it); }
-        state[fromKey] = remain; state[toKey] = [...to, ...moved];
+        state[fromKey] = remain; state[toKey] = [...to, ...moved.map(i => toKey==='ignored'? {...i, staged:false }: i)];
       };
       const remove = (ps) => {
         const set = new Set(ps);
-        state.staged = state.staged.filter(i => !set.has(i.path));
-        state.unstaged = state.unstaged.filter(i => !set.has(i.path));
+        state.staged = (state.staged||[]).filter(i => !set.has(i.path));
+        state.unstaged = (state.unstaged||[]).filter(i => !set.has(i.path));
+        state.ignored = (state.ignored||[]).filter(i => !set.has(i.path));
       };
+
       ({
         stageFile:     () => { move(list, 'unstaged', 'staged'); render(state); },
         unstageFile:   () => { move(list, 'staged', 'unstaged'); render(state); },
@@ -647,12 +706,29 @@ window.addEventListener('message', (ev) => {
         stageMany:     () => { move(list, 'unstaged', 'staged'); render(state); },
         unstageMany:   () => { move(list, 'staged', 'unstaged'); render(state); },
         discardMany:   () => { remove(list); render(state); },
-        stageAll:      () => { const all = state.unstaged.map(i=>i.path); move(all, 'unstaged', 'staged'); render(state); },
-        unstageAll:    () => { const all = state.staged.map(i=>i.path); move(all, 'staged', 'unstaged'); render(state); },
-        discardAll:    () => { state = { staged: [], unstaged: [] }; render(state); },
+        stageAll:      () => { const ignored = new Set((state.ignored||[]).map(i=>i.path)); const all = state.unstaged.filter(i=>!ignored.has(i.path)).map(i=>i.path); move(all, 'unstaged', 'staged'); render(state); },
+        unstageAll:    () => { const ignored = new Set((state.ignored||[]).map(i=>i.path)); const all = state.staged.filter(i=>!ignored.has(i.path)).map(i=>i.path); move(all, 'staged', 'unstaged'); render(state); },
+        discardAll:    () => { const ignored = new Set((state.ignored||[]).map(i=>i.path)); const keep = (arr)=>arr.filter(i=>ignored.has(i.path)); state = { staged: keep(state.staged), unstaged: keep(state.unstaged), ignored: state.ignored }; render(state); },
+        ignore:        () => { // move from staged/unstaged to ignored
+          for (const p of list) {
+            state.staged = state.staged.filter(i=>i.path!==p);
+            const hit = state.unstaged.find(i=>i.path===p) || state.staged.find(i=>i.path===p) || snapshot.get(p) || { path:p, full:p, status:'M', staged:false };
+            state.unstaged = state.unstaged.filter(i=>i.path!==p);
+            if (!state.ignored.some(i=>i.path===p)) state.ignored.push({ ...hit, staged:false });
+          }
+          render(state);
+        },
+        unignore:      () => { // move from ignored to unstaged
+          for (const p of list) {
+            state.ignored = state.ignored.filter(i=>i.path!==p);
+            const hit = snapshot.get(p) || { path:p, full:p, status:'M', staged:false };
+            if (!state.unstaged.some(i=>i.path===p)) state.unstaged.push({ ...hit, staged:false });
+          }
+          render(state);
+        },
       }[op] || (()=>{}))();
     },
-      clearMsg: () => {
+    clearMsg: () => {
       $msg.value = '';
       const next = { ...(vscode.getState?.() || {}), msg: '' };
       vscode.setState?.(next);
@@ -684,7 +760,6 @@ document.addEventListener('click', (e) => {
   e.preventDefault();
   const act = a.getAttribute('data-action');
   ({
-    refresh:    () => post('requestState'),
     stageAll:   () => post('stageAll'),
     unstageAll: () => post('unstageAll'),
     discardAll: () => post('discardAll'),
@@ -693,6 +768,8 @@ document.addEventListener('click', (e) => {
     commitPush: () => post('commitPush', { message: $msg.value }),
     discard:    () => post('discard', { path: a.getAttribute('data-path') }),
     openDiff:   () => post('openDiff', { path: a.getAttribute('data-path') }),
+    ignore:     () => post('ignoreFile', { path: a.getAttribute('data-path') }),
+    unignore:   () => post('unignoreFile', { path: a.getAttribute('data-path') }),
   }[act] || (()=>{}))();
 });
 
@@ -712,7 +789,6 @@ post('requestState');
 
 /* =============== Handlers =============== */
 
-// m פרמטר אופציונלי
 const handlers: Record<string, (m?: any) => Promise<void>> = {
   requestState: async () => { /* handled per-view */ },
 
@@ -722,20 +798,33 @@ const handlers: Record<string, (m?: any) => Promise<void>> = {
     optimistic({ op: 'stageAll' });
     try {
       const cwd = repo.rootUri.fsPath;
+      const ignored = await getIgnoredSet(cwd);
       const paths = [
         ...(repo.state?.workingTreeChanges ?? []).map((c: any) => rel(cwd, c.uri.fsPath)),
         ...(repo.state?.mergeChanges ?? []).map((c: any) => rel(cwd, c.uri.fsPath)),
-      ];
+      ].filter(p => !ignored.has(p));
       if (paths.length) await repo.add(paths); else await repo.add([]);
-    } catch { await runGit(['add', '-A'], repo.rootUri.fsPath); }
+    } catch {
+      const api2 = await ensureGitApi(); const repo2 = bestRepo(api2) ?? await waitForRepo(); if (!repo2) return;
+      const cwd = repo2.rootUri.fsPath;
+      const ignored = await getIgnoredSet(cwd);
+      const out = await runGit(['ls-files', '--modified', '--others', '--exclude-standard'], cwd).catch(() => '');
+      const all = out.split(/\r?\n/).map(s => s.trim()).filter(Boolean).filter(p => !ignored.has(p));
+      if (all.length) await runGit(['add', '--', ...all], cwd); else await runGit(['add', '-A'], cwd);
+    }
   }),
 
   unstageAll: () => runBatch(async () => {
     const api = await ensureGitApi(); const repo = bestRepo(api) ?? await waitForRepo(); if (!repo) return;
     optimistic({ op: 'unstageAll' });
     const cwd = repo.rootUri.fsPath;
-    if (await hasHead(cwd)) await runGit(['reset', '-q', 'HEAD', '--', '.'], cwd);
-    else await runGit(['rm', '--cached', '-r', '.'], cwd);
+    const ignored = await getIgnoredSet(cwd);
+    const stagedPaths = (repo.state?.indexChanges ?? [])
+      .map((c: any) => rel(cwd, c.uri.fsPath))
+      .filter((p: string) => !ignored.has(p));
+    if (!stagedPaths.length) return;
+    if (await hasHead(cwd)) await runGit(['reset', '-q', 'HEAD', '--', ...stagedPaths], cwd);
+    else await runGit(['rm', '--cached', '--', ...stagedPaths], cwd);
   }),
 
   discardAll: () => runBatch(async () => {
@@ -743,32 +832,46 @@ const handlers: Record<string, (m?: any) => Promise<void>> = {
     const cwd = repo.rootUri.fsPath;
     const has = await hasHead(cwd);
     const confirmMsg = has
-      ? 'Discard ALL local changes? This cannot be undone.'
-      : 'No commits yet. Discard All will remove ALL untracked files from disk. Continue?';
+      ? 'Discard ALL local changes (ignored files will be preserved)? This cannot be undone.'
+      : 'No commits yet. Discard All will remove ALL untracked files from disk (ignored files will be preserved). Continue?';
     const confirm = await vscode.window.showWarningMessage(confirmMsg, { modal: true }, 'Discard');
     if (confirm !== 'Discard') return;
 
     optimistic({ op: 'discardAll' });
     try {
+      const ignored = await getIgnoredSet(cwd);
       if (has) {
         const wt = repo.state?.workingTreeChanges ?? [];
         const tracked: string[] = [];
         const untracked: string[] = [];
         for (const ch of wt) {
           const p = rel(cwd, ch.uri.fsPath);
+          if (ignored.has(p)) continue;
           const isUntracked = !!(await runGit(['ls-files', '--others', '--exclude-standard', '--', p], cwd)).trim();
           (isUntracked ? untracked : tracked).push(p);
         }
         if (tracked.length) await repo.revert(tracked);
         if (untracked.length) await repo.clean(untracked);
       } else {
-        try { await runGit(['rm', '--cached', '-r', '.'], cwd); } catch { }
-        await runGit(['clean', '-fd'], cwd);
+        const out = await runGit(['ls-files', '--others', '--exclude-standard'], cwd).catch(() => '');
+        const untracked = out.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+        const ignoredSet = await getIgnoredSet(cwd);
+        const filtered = untracked.filter((p: string) => !ignoredSet.has(p));
+        for (const p of filtered) { try { await runGit(['clean', '-f', '--', p], cwd); } catch { } }
       }
     } catch {
-      try { await runGit(['restore', '--worktree', '--staged', '--source=HEAD', '.'], cwd); }
-      catch { await runGit(['checkout', '--', '.'], cwd); }
-      await runGit(['clean', '-fd'], cwd);
+      try {
+        const ignored = await getIgnoredSet(cwd);
+        const outTracked = await runGit(['diff', '--name-only'], cwd).catch(() => '');
+        const tracked = outTracked.split(/\r?\n/).map(s => s.trim()).filter(Boolean).filter(p => !ignored.has(p));
+        if (tracked.length) {
+          try { await runGit(['restore', '--worktree', '--staged', '--source=HEAD', '--', ...tracked], cwd); }
+          catch { await runGit(['checkout', '--', ...tracked], cwd); }
+        }
+        const outUntracked = await runGit(['ls-files', '--others', '--exclude-standard'], cwd).catch(() => '');
+        const untracked = outUntracked.split(/\r?\n/).map(s => s.trim()).filter(Boolean).filter(p => !ignored.has(p));
+        if (untracked.length) await runGit(['clean', '-f', '--', ...untracked], cwd);
+      } catch { /* swallow */ }
     }
   }),
 
@@ -800,6 +903,24 @@ const handlers: Record<string, (m?: any) => Promise<void>> = {
     }
   }),
 
+  // NEW: toggle ignored
+  ignoreFile: async (m) => {
+    const api = await ensureGitApi(); const repo = bestRepo(api) ?? await waitForRepo(); if (!repo) return;
+    const cwd = repo.rootUri.fsPath;
+    optimistic({ op: 'ignore', path: m?.path });
+    await addIgnored(cwd, [m.path]);
+    // If it was staged, unstage so it won't commit
+    if (await hasHead(cwd)) { try { await runGit(['reset', '-q', 'HEAD', '--', m.path], cwd); } catch { } }
+    else { try { await runGit(['rm', '--cached', '--', m.path], cwd); } catch { } }
+  },
+
+  unignoreFile: async (m) => {
+    const api = await ensureGitApi(); const repo = bestRepo(api) ?? await waitForRepo(); if (!repo) return;
+    const cwd = repo.rootUri.fsPath;
+    optimistic({ op: 'unignore', path: m?.path });
+    await removeIgnored(cwd, [m.path]);
+  },
+
   openDiff: async (m) => {
     const api = await ensureGitApi(); const repo = bestRepo(api) ?? await waitForRepo(); if (!repo) return;
     const abs = path.join(repo.rootUri.fsPath, m.path);
@@ -815,8 +936,22 @@ const handlers: Record<string, (m?: any) => Promise<void>> = {
     const cwd = repo.rootUri.fsPath;
     const message = String(m?.message ?? '').trim();
     if (!message) throw new Error('Commit message is required.');
-    const stagedList = await runGit(['diff', '--cached', '--name-only'], cwd).catch(() => '');
-    if (!stagedList.trim()) throw new Error('No staged changes. Stage files first.');
+
+    const stagedListRaw = await runGit(['diff', '--cached', '--name-only'], cwd).catch(() => '');
+    const stagedAll = stagedListRaw.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+    if (!stagedAll.length) throw new Error('No staged changes. Stage files first.');
+
+    const ignored = await getIgnoredSet(cwd);
+    const blocked = stagedAll.filter(p => ignored.has(p));
+    const allowed = stagedAll.filter(p => !ignored.has(p));
+    if (!allowed.length) throw new Error('All staged changes are ignored. Unignore files or stage non-ignored files.');
+
+    // ensure ignored files aren't accidentally committed
+    if (blocked.length) {
+      if (await hasHead(cwd)) await runGit(['reset', '-q', 'HEAD', '--', ...blocked], cwd);
+      else await runGit(['rm', '--cached', '--', ...blocked], cwd);
+    }
+
     const cfg = vscode.workspace.getConfiguration();
     if (cfg.get<boolean>(SETTINGS.wipGuard) && /(^|\s)wip(\s|$)/i.test(message)) {
       throw new Error(`WIP is blocked by settings (${SETTINGS.wipGuard}).`);
@@ -828,10 +963,10 @@ const handlers: Record<string, (m?: any) => Promise<void>> = {
         if (ok !== 'Commit') return;
       }
     }
+
     try { await repo.commit(message, {}); }
     catch { await runGit(['commit', '-m', message, '--no-gpg-sign'], cwd); }
 
-    // notify webview to clear commit message
     postToViewGlobal?.({ type: 'clearMsg' });
   }),
 
@@ -847,7 +982,6 @@ const handlers: Record<string, (m?: any) => Promise<void>> = {
     const ahead = repo.state?.HEAD?.ahead ?? null;
     const upstream = await getUpstream(cwd);
 
-    // Nothing to push (fast path)
     if (upstream && ahead !== null && ahead === 0) {
       vscode.window.showInformationMessage('Push&Go: Nothing to push — already up to date.');
       return;
@@ -862,7 +996,6 @@ const handlers: Record<string, (m?: any) => Promise<void>> = {
       return remotes[0];
     };
 
-    // Single, explicit push path to avoid "git push -u dev"
     const pushCli = async (remote: string, br: string, setUpstream: boolean) => {
       const args = setUpstream ? ['push', '-u', remote, br] : ['push', remote, br];
       await runGit(args, cwd);
@@ -871,13 +1004,7 @@ const handlers: Record<string, (m?: any) => Promise<void>> = {
 
     try {
       await runWithProgress('Push&Go: Pushing…', async () => {
-        if (upstream) {
-          // Upstream exists → push to it explicitly (no -u)
-          await pushCli(upstream.remote, branch, false);
-          return;
-        }
-
-        // No upstream → pick/create a remote and set upstream
+        if (upstream) { await pushCli(upstream.remote, branch, false); return; }
         let remote = await resolveRemote();
         if (!remote) {
           remote = await pickOrCreateRemote(cwd);
@@ -890,8 +1017,6 @@ const handlers: Record<string, (m?: any) => Promise<void>> = {
       vscode.window.showErrorMessage(`Push&Go: Push failed.\n${msg}`); log('push error:', msg);
     }
   },
-
-
 
   commitPush: async (m) => { await handlers.commit(m); await handlers.push(m); },
 
@@ -927,7 +1052,8 @@ async function stageFromExplorer(uri?: vscode.Uri, uris?: vscode.Uri[]) {
     const ctx = await withRepo(); if (!ctx) return;
     const { repo } = ctx;
     const cwd = repo.rootUri.fsPath;
-    const paths = toPaths(cwd, uri, uris);
+    const ignored = await getIgnoredSet(cwd);
+    const paths = toPaths(cwd, uri, uris).filter(p => !ignored.has(p));
     if (!paths.length) return;
     optimistic({ op: 'stageMany', paths });
     try { await repo.add(paths); } catch { await runGit(['add', '--', ...paths], cwd); }
@@ -939,7 +1065,8 @@ async function unstageFromExplorer(uri?: vscode.Uri, uris?: vscode.Uri[]) {
   await runBatch(async () => {
     const ctx = await withRepo(); if (!ctx) return;
     const { repo } = ctx; const cwd = repo.rootUri.fsPath;
-    const paths = toPaths(cwd, uri, uris);
+    const ignored = await getIgnoredSet(cwd);
+    const paths = toPaths(cwd, uri, uris).filter(p => !ignored.has(p));
     if (!paths.length) return;
     optimistic({ op: 'unstageMany', paths });
     if (await hasHead(cwd)) await runGit(['reset', '-q', 'HEAD', '--', ...paths], cwd);
@@ -952,7 +1079,8 @@ async function discardFromExplorer(uri?: vscode.Uri, uris?: vscode.Uri[]) {
   await runBatch(async () => {
     const ctx = await withRepo(); if (!ctx) return;
     const { repo } = ctx; const cwd = repo.rootUri.fsPath;
-    const paths = toPaths(cwd, uri, uris);
+    const ignored = await getIgnoredSet(cwd);
+    const paths = toPaths(cwd, uri, uris).filter(p => !ignored.has(p));
     if (!paths.length) return;
 
     optimistic({ op: 'discardMany', paths });
@@ -986,10 +1114,15 @@ async function commitThisFromExplorer(uri?: vscode.Uri, uris?: vscode.Uri[]) {
   await runBatch(async () => {
     const ctx = await withRepo(); if (!ctx) return;
     const { repo } = ctx; const cwd = repo.rootUri.fsPath;
+    const ignored = await getIgnoredSet(cwd);
     const paths = toPaths(cwd, uri, uris);
     if (!paths.length) return;
 
-    try { await repo.add(paths); } catch { await runGit(['add', '--', ...paths], cwd); }
+    // Stage selected (filter ignored)
+    const stageable = paths.filter(p => !ignored.has(p));
+    if (stageable.length) {
+      try { await repo.add(stageable); } catch { await runGit(['add', '--', ...stageable], cwd); }
+    }
 
     const msg = await vscode.window.showInputBox({
       prompt: `Commit message (for ${paths.length} file${paths.length > 1 ? 's' : ''})`,
@@ -1013,15 +1146,22 @@ async function commitThisFromExplorer(uri?: vscode.Uri, uris?: vscode.Uri[]) {
 
     const s = await runGit(['diff', '--cached', '--name-only', '--', ...paths], cwd).catch(() => '');
     const stagedSubset = s.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
-    if (!stagedSubset.length) { vscode.window.showInformationMessage('Push&Go: No staged changes in the selected file(s).'); return; }
+
+    // Unstage any ignored that slipped in
+    const blocked = stagedSubset.filter(p => ignored.has(p));
+    if (blocked.length) {
+      if (await hasHead(cwd)) await runGit(['reset', '-q', 'HEAD', '--', ...blocked], cwd);
+      else await runGit(['rm', '--cached', '--', ...blocked], cwd);
+    }
+
+    const finalDiff = await runGit(['diff', '--cached', '--name-only'], cwd).catch(() => '');
+    const finalStaged = finalDiff.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
+    if (!finalStaged.length) { vscode.window.showInformationMessage('Push&Go: No staged changes (ignored files were excluded).'); return; }
 
     try { await repo.commit(msg.trim(), {}); }
-    catch { await runGit(['commit', '-m', msg.trim(), '--no-gpg-sign', '--', ...paths], cwd); }
+    catch { await runGit(['commit', '-m', msg.trim(), '--no-gpg-sign'], cwd); }
 
-    // notify webview to clear commit message if it’s open
     postToViewGlobal?.({ type: 'clearMsg' });
-
-    vscode.window.showInformationMessage(`Push&Go: Committed ${stagedSubset.length} file(s).`);
-
+    vscode.window.showInformationMessage(`Push&Go: Committed ${finalStaged.length} file(s).`);
   });
 }

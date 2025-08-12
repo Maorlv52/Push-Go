@@ -402,6 +402,19 @@ body{ margin:0; color:var(--fg); background:var(--bg); font: normal var(--fs-12)
 .main{ overflow:auto; padding:10px; }
 .group{ margin-top: 6px; }
 .ttl{ margin:6px 0; font-weight:600; font-size:12px; display:flex; gap:8px; align-items:center; }
+/* collapsible group header */
+.ttl.toggle{
+  display:flex; align-items:center; gap:8px;
+  padding:0; margin:6px 0; background:transparent; border:0; color:var(--fg);
+  font-weight:600; font-size:12px; cursor:pointer;
+}
+.ttl .chev { 
+  margin-right: 6px; 
+  transition: transform .15s ease; 
+}
+.group.collapsed .list{ display:none; }
+.group.collapsed .chev{ transform: rotate(-90deg); }
+
 .empty{ color:var(--muted); font-style:italic; padding:6px 0 8px; }
 .list{ display:flex; flex-direction:column; gap:2px; }
 .row{
@@ -472,20 +485,36 @@ textarea{
       <button class="btn xs ghost" data-action="discardAll">Discard All</button>
     </div>
 
-    <div class="main">
-      <div class="group">
-        <div class="ttl">Staged <span id="stagedCount" style="color:var(--muted)"></span></div>
-        <div id="stagedList" class="list"><div class="empty">No files</div></div>
-      </div>
-      <div class="group">
-        <div class="ttl">Unstaged <span id="unstagedCount" style="color:var(--muted)"></span></div>
-        <div id="unstagedList" class="list"><div class="empty">No files</div></div>
-      </div>
-      <div class="group">
-        <div class="ttl">Ignored (local) <span id="ignoredCount" style="color:var(--muted)"></span></div>
-        <div id="ignoredList" class="list"><div class="empty">No files</div></div>
-      </div>
-    </div>
+<div class="main">
+  <!-- Staged -->
+  <div class="group" id="grp-staged" data-group="staged">
+    <button class="ttl toggle" type="button" data-action="toggleGroup" data-group="staged" aria-expanded="true">
+      <span class="chev" aria-hidden="true">▾</span>
+      Staged <span id="stagedCount" style="color:var(--muted)"></span>
+    </button>
+    <div id="stagedList" class="list"><div class="empty">No files</div></div>
+  </div>
+
+  <!-- Unstaged -->
+  <div class="group" id="grp-unstaged" data-group="unstaged">
+    <button class="ttl toggle" type="button" data-action="toggleGroup" data-group="unstaged" aria-expanded="true">
+      <span class="chev" aria-hidden="true">▾</span>
+      Unstaged <span id="unstagedCount" style="color:var(--muted)"></span>
+    </button>
+    <div id="unstagedList" class="list"><div class="empty">No files</div></div>
+  </div>
+
+  <!-- Ignored (local) -->
+  <div class="group" id="grp-ignored" data-group="ignored">
+    <button class="ttl toggle" type="button" data-action="toggleGroup" data-group="ignored" aria-expanded="true">
+      <span class="chev" aria-hidden="true">▾</span>
+      Ignored (local) <span id="ignoredCount" style="color:var(--muted)"></span>
+    </button>
+    <div id="ignoredList" class="list"><div class="empty">No files</div></div>
+  </div>
+</div>
+
+
 
     <div class="ftr">
       <div id="status" class="status" aria-live="polite"></div>
@@ -629,6 +658,8 @@ function render(nextState){
   counts.textContent = \`\${staged.length} staged · \${unstaged.length} unstaged\`;
 
   updateSnapshot(state);
+
+  applyCollapseUI();
 }
 
 window.addEventListener('message', (ev) => {
@@ -741,6 +772,45 @@ const $msg = $('#msg');
 const restore = vscode.getState?.() || {};
 if (restore.msg) $msg.value = restore.msg;
 
+// --- Collapsible sections state (versioned so we can change defaults) ---
+const UI_VER = 2; // bump when changing defaults
+const defaultCollapse = { staged: false, unstaged: false, ignored: true };
+
+// Use saved collapse only if it matches our current UI version
+const savedCollapse = restore.uiVer === UI_VER ? (restore.collapse || {}) : {};
+
+let collapse = {
+  staged:  savedCollapse.staged  ?? defaultCollapse.staged,
+  unstaged:savedCollapse.unstaged?? defaultCollapse.unstaged,
+  ignored: savedCollapse.ignored ?? defaultCollapse.ignored,
+};
+
+// If version changed, persist fresh defaults immediately
+if (restore.uiVer !== UI_VER) {
+  vscode.setState?.({ ...restore, uiVer: UI_VER, collapse });
+}
+
+const applyCollapseUI = () => {
+  const groups = [
+    ['staged',   '#grp-staged'],
+    ['unstaged', '#grp-unstaged'],
+    ['ignored',  '#grp-ignored'],
+  ];
+  for (const [name, sel] of groups) {
+    const wrap = $(sel);
+    if (!wrap) continue;
+    const isCollapsed = !!collapse[name];
+    wrap.classList.toggle('collapsed', isCollapsed);
+    const btn = wrap.querySelector('button.ttl.toggle');
+    if (btn) btn.setAttribute('aria-expanded', String(!isCollapsed));
+  }
+};
+
+// initial paint
+applyCollapseUI();
+
+
+
 const setCommitButtons = () => {
   const enabled = !!$msg.value.trim();
   $$('.btn[data-action="commit"], .btn[data-action="commitPush"]').forEach(b => b.disabled = !enabled);
@@ -755,23 +825,36 @@ $msg.addEventListener('input', () => {
 
 document.addEventListener('click', (e) => {
   const a = e.target.closest('[data-action]');
-  if(!a) return;
+  if (!a) return;
   if (a.hasAttribute('disabled')) return;
   e.preventDefault();
+
   const act = a.getAttribute('data-action');
   ({
-    stageAll:   () => post('stageAll'),
-    unstageAll: () => post('unstageAll'),
-    discardAll: () => post('discardAll'),
-    commit:     () => post('commit', { message: $msg.value }),
-    push:       () => post('push'),
-    commitPush: () => post('commitPush', { message: $msg.value }),
-    discard:    () => post('discard', { path: a.getAttribute('data-path') }),
-    openDiff:   () => post('openDiff', { path: a.getAttribute('data-path') }),
-    ignore:     () => post('ignoreFile', { path: a.getAttribute('data-path') }),
-    unignore:   () => post('unignoreFile', { path: a.getAttribute('data-path') }),
-  }[act] || (()=>{}))();
+    stageAll:    () => post('stageAll'),
+    unstageAll:  () => post('unstageAll'),
+    discardAll:  () => post('discardAll'),
+    commit:      () => post('commit', { message: $msg.value }),
+    push:        () => post('push'),
+    commitPush:  () => post('commitPush', { message: $msg.value }),
+    discard:     () => post('discard', { path: a.getAttribute('data-path') }),
+    openDiff:    () => post('openDiff', { path: a.getAttribute('data-path') }),
+    ignore:      () => post('ignoreFile', { path: a.getAttribute('data-path') }),
+    unignore:    () => post('unignoreFile', { path: a.getAttribute('data-path') }),
+
+    // collapse/expand group + persist
+    toggleGroup: () => {
+  const group = a.getAttribute('data-group'); // "staged" | "unstaged" | "ignored"
+  if (!group) return;
+  collapse = { ...collapse, [group]: !collapse[group] };
+  const next = { ...(vscode.getState?.() || {}), uiVer: UI_VER, collapse };
+  vscode.setState?.(next);
+  applyCollapseUI();
+},
+
+  }[act] || (() => {}))();
 });
+
 
 document.addEventListener('change', (e) => {
   const cb = e.target.closest('input[type="checkbox"][data-path]');

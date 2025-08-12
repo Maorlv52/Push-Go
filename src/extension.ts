@@ -91,22 +91,20 @@ async function ensureGitAvailable(): Promise<boolean> {
   }
 }
 
-/* ---- precise state helpers ---- */
+/* precise state helpers */
 async function getStagedFiles(cwd: string): Promise<string[]> {
   try {
     const s = await runGit(['diff', '--cached', '--name-only'], cwd);
     return s.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
   } catch { return []; }
 }
-
 async function getUpstreamRef(cwd: string): Promise<string> {
   try { return await runGit(['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'], cwd); }
-  catch { return ''; } // no upstream
+  catch { return ''; }
 }
-
 async function countAhead(cwd: string): Promise<number | null> {
   const upstream = await getUpstreamRef(cwd);
-  if (!upstream) return null; // unknown (no upstream)
+  if (!upstream) return null;
   try {
     const n = await runGit(['rev-list', '--count', '@{u}..HEAD'], cwd);
     return Number(n || '0') || 0;
@@ -121,6 +119,16 @@ function debounce<F extends (...args: any[]) => any>(fn: F, ms = 150) {
     t = setTimeout(() => fn(...args), ms);
   };
 }
+
+const rel = (root: string, fsPath: string) =>
+  path.relative(root, fsPath).replace(/\\/g, '/');
+
+const toPaths = (root: string, uri?: vscode.Uri, uris?: vscode.Uri[]) => {
+  const arr = (uris && uris.length ? uris : uri ? [uri] : [])
+    .filter(Boolean)
+    .map(u => rel(root, u!.fsPath));
+  return Array.from(new Set(arr)); // unique
+};
 
 /* remotes helpers */
 async function listRemotes(cwd: string): Promise<string[]> {
@@ -191,8 +199,8 @@ const mapStatus = (s: any, c: any): UiChange['status'] => {
 
 function toUiChange(repo: any, change: any, staged: boolean): UiChange {
   const full = change?.uri?.fsPath ?? '';
-  const rel = full ? path.relative(repo.rootUri.fsPath, full).replace(/\\/g, '/') : '';
-  return { path: rel || full || '(unknown)', full, status: mapStatus(change?.status, change), staged };
+  const r = full ? rel(repo.rootUri.fsPath, full) : '';
+  return { path: r || full || '(unknown)', full, status: mapStatus(change?.status, change), staged };
 }
 
 function dedupeByFull<T extends UiChange>(arr: T[]) {
@@ -230,8 +238,17 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(PushGoViewProvider.VIEW_ID, provider, { webviewOptions: { retainContextWhenHidden: true } }),
     vscode.commands.registerCommand('pushGo.open', () => vscode.commands.executeCommand('workbench.view.extension.pushGo')),
+
+    // palette/webview helpers
     vscode.commands.registerCommand('pushGo.commit', () => handlers.commitCommand()),
     vscode.commands.registerCommand('pushGo.commitPush', () => handlers.commitPushCommand()),
+
+    // Explorer commands (קולטות URI/URIs, עובדות בלי webview)
+    vscode.commands.registerCommand('pushGo.stageFile', (uri?: vscode.Uri, uris?: vscode.Uri[]) => stageFromExplorer(uri, uris)),
+    vscode.commands.registerCommand('pushGo.unstageFile', (uri?: vscode.Uri, uris?: vscode.Uri[]) => unstageFromExplorer(uri, uris)),
+    vscode.commands.registerCommand('pushGo.discardFile', (uri?: vscode.Uri, uris?: vscode.Uri[]) => discardFromExplorer(uri, uris)),
+    vscode.commands.registerCommand('pushGo.openDiffFile', (uri?: vscode.Uri) => openDiffFromExplorer(uri)),
+    vscode.commands.registerCommand('pushGo.commitThisFile', (uri?: vscode.Uri, uris?: vscode.Uri[]) => commitThisFromExplorer(uri, uris)),
   );
   // לא חוסם, רק מזכיר אם Git לא זמין
   void ensureGitAvailable();
@@ -562,7 +579,7 @@ const handlers: Record<string, (m?: any) => Promise<void>> = {
     }
   },
 
-  /* Per file */
+  /* Per file (webview usage) */
   stageFile: async (m) => {
     const api = await ensureGitApi(); const repo = bestRepo(api) ?? await waitForRepo(); if (!repo) return;
     await runGit(['add', '--', m.path], repo.rootUri.fsPath);
@@ -666,7 +683,6 @@ const handlers: Record<string, (m?: any) => Promise<void>> = {
       vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title }, task);
 
     const doPlainPush = async () => {
-      // אם יש upstream ואנחנו לא ahead → אין מה לדחוף
       const ahead = await countAhead(cwd);
       if (ahead !== null && ahead === 0) {
         vscode.window.showInformationMessage('Push&Go: Nothing to push — already up to date.');
@@ -723,3 +739,139 @@ const handlers: Record<string, (m?: any) => Promise<void>> = {
     if (msg) await handlers.commitPush({ message: msg });
   },
 };
+
+/* ===== Explorer command implementations (URI aware) ===== */
+
+async function withRepo(): Promise<{ api: any, repo: any } | undefined> {
+  const api = await ensureGitApi();
+  const repo = bestRepo(api) ?? await waitForRepo();
+  if (!repo) { vscode.window.showErrorMessage('Push&Go: No Git repository found.'); return; }
+  return { api, repo };
+}
+
+async function stageFromExplorer(uri?: vscode.Uri, uris?: vscode.Uri[]) {
+  const ctx = await withRepo(); if (!ctx) return;
+  const { repo } = ctx;
+  const cwd = repo.rootUri.fsPath;
+  const paths = toPaths(cwd, uri, uris);
+  if (!paths.length) return;
+  await runGit(['add', '--', ...paths], cwd);
+  vscode.window.showInformationMessage(`Push&Go: Staged ${paths.length} file(s).`);
+}
+
+async function unstageFromExplorer(uri?: vscode.Uri, uris?: vscode.Uri[]) {
+  const ctx = await withRepo(); if (!ctx) return;
+  const { repo } = ctx;
+  const cwd = repo.rootUri.fsPath;
+  const paths = toPaths(cwd, uri, uris);
+  if (!paths.length) return;
+  if (await hasHead(cwd)) {
+    await runGit(['reset', '-q', 'HEAD', '--', ...paths], cwd);
+  } else {
+    await runGit(['rm', '--cached', '--', ...paths], cwd);
+  }
+  vscode.window.showInformationMessage(`Push&Go: Unstaged ${paths.length} file(s).`);
+}
+
+async function discardFromExplorer(uri?: vscode.Uri, uris?: vscode.Uri[]) {
+  const ctx = await withRepo(); if (!ctx) return;
+  const { repo } = ctx;
+  const cwd = repo.rootUri.fsPath;
+  const paths = toPaths(cwd, uri, uris);
+  if (!paths.length) return;
+
+  const doOne = async (p: string) => {
+    if (await hasHead(cwd)) {
+      const isUntracked = !!(await runGit(['ls-files', '--others', '--exclude-standard', '--', p], cwd)).trim();
+      if (isUntracked) await runGit(['clean', '-f', '--', p], cwd);
+      else {
+        try { await runGit(['restore', '--worktree', '--staged', '--source=HEAD', '--', p], cwd); }
+        catch { await runGit(['checkout', '--', p], cwd); }
+      }
+    } else {
+      try { await runGit(['rm', '--cached', '--', p], cwd); } catch {}
+      await runGit(['clean', '-f', '--', p], cwd);
+    }
+  };
+
+  await Promise.all(paths.map(doOne));
+  vscode.window.showInformationMessage(`Push&Go: Discarded changes for ${paths.length} file(s).`);
+}
+
+async function openDiffFromExplorer(uri?: vscode.Uri) {
+  const ctx = await withRepo(); if (!ctx || !uri) return;
+  const { repo } = ctx;
+  const cwd = repo.rootUri.fsPath;
+  const fileUri = uri;
+
+  if (!(await hasHead(cwd))) {
+    await vscode.commands.executeCommand('vscode.open', fileUri);
+    return;
+  }
+
+  const all = [
+    ...(repo.state?.indexChanges ?? []),
+    ...(repo.state?.workingTreeChanges ?? []),
+    ...(repo.state?.mergeChanges ?? []),
+  ];
+  const changeForFile = all.find((c: any) => c?.uri?.fsPath === fileUri.fsPath);
+  const leftFsPath = changeForFile?.renameUri?.fsPath ?? fileUri.fsPath;
+
+  const left = vscode.Uri.from({
+    scheme: 'git',
+    path: vscode.Uri.file(leftFsPath).path,
+    query: JSON.stringify({ path: leftFsPath, ref: 'HEAD' }),
+  });
+
+  const title =
+    changeForFile?.renameUri
+      ? `${rel(cwd, fileUri.fsPath)} (from ${rel(cwd, changeForFile.renameUri.fsPath)})`
+      : rel(cwd, fileUri.fsPath);
+
+  await vscode.commands.executeCommand('vscode.diff', left, fileUri, title);
+}
+
+async function commitThisFromExplorer(uri?: vscode.Uri, uris?: vscode.Uri[]) {
+  const ctx = await withRepo(); if (!ctx) return;
+  const { repo } = ctx;
+  const cwd = repo.rootUri.fsPath;
+  const paths = toPaths(cwd, uri, uris);
+  if (!paths.length) return;
+
+  // שלב 1: stage ספציפי
+  await runGit(['add', '--', ...paths], cwd);
+
+  // שלב 2: הודעת קומיט
+  const msg = await vscode.window.showInputBox({
+    prompt: `Commit message (for ${paths.length} file${paths.length > 1 ? 's' : ''})`,
+    placeHolder: 'Required…',
+    validateInput: v => v.trim() ? undefined : 'Message required'
+  });
+  if (!msg) return;
+
+  // Guard-rails כרגיל
+  const cfg = vscode.workspace.getConfiguration();
+  if (cfg.get<boolean>(SETTINGS.wipGuard) && /(^|\s)wip(\s|$)/i.test(msg.trim())) {
+    vscode.window.showErrorMessage(`Push&Go: WIP is blocked by settings (${SETTINGS.wipGuard}).`);
+    return;
+  }
+  if (cfg.get<boolean>(SETTINGS.blockOnMain)) {
+    const b = await getBranch(cwd);
+    if (['main', 'master'].includes(b)) {
+      const ok = await vscode.window.showWarningMessage(`Commit on "${b}"?`, { modal: true }, 'Commit');
+      if (ok !== 'Commit') return;
+    }
+  }
+
+  // ודא שיש מה לקממט עבור הקבצים הנבחרים
+  const s = await runGit(['diff', '--cached', '--name-only', '--', ...paths], cwd).catch(() => '');
+  const stagedSubset = s.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
+  if (!stagedSubset.length) {
+    vscode.window.showInformationMessage('Push&Go: No staged changes in the selected file(s).');
+    return;
+  }
+
+  // קומיט ממוקד
+  await runGit(['commit', '-m', msg.trim(), '--no-gpg-sign', '--', ...paths], cwd);
+  vscode.window.showInformationMessage(`Push&Go: Committed ${stagedSubset.length} file(s).`);
+}

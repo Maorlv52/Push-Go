@@ -12,7 +12,12 @@
     "onView:pushGo.sidebar",
     "onCommand:pushGo.open",
     "onCommand:pushGo.commit",
-    "onCommand:pushGo.commitPush"
+    "onCommand:pushGo.commitPush",
+    "onCommand:pushGo.stageFile",
+    "onCommand:pushGo.unstageFile",
+    "onCommand:pushGo.discardFile",
+    "onCommand:pushGo.openDiffFile",
+    "onCommand:pushGo.commitThisFile"
   ],
   "extensionDependencies": [
     "vscode.git"
@@ -31,8 +36,33 @@
     "commands": [
       { "command": "pushGo.open", "title": "Push&Go: Focus" },
       { "command": "pushGo.commit", "title": "Push&Go: Commit" },
-      { "command": "pushGo.commitPush", "title": "Push&Go: Commit + Push" }
+      { "command": "pushGo.commitPush", "title": "Push&Go: Commit + Push" },
+
+      { "command": "pushGo.stageFile", "title": "Push&Go: Stage" },
+      { "command": "pushGo.unstageFile", "title": "Push&Go: Unstage" },
+      { "command": "pushGo.discardFile", "title": "Push&Go: Discard" },
+      { "command": "pushGo.openDiffFile", "title": "Push&Go: Open Diff" },
+      { "command": "pushGo.commitThisFile", "title": "Push&Go: Commit This File(s)" }
     ],
+    "submenus": [
+      { "id": "pushGo.explorer", "label": "Push&Go" }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "submenu": "pushGo.explorer",
+          "group": "navigation@99",
+          "when": "gitOpenRepositoryCount != 0 && resourceScheme == file"
+        }
+      ],
+      "pushGo.explorer": [
+        { "command": "pushGo.stageFile", "group": "1_mod" },
+        { "command": "pushGo.unstageFile", "group": "1_mod" },
+        { "command": "pushGo.discardFile", "group": "1_mod" },
+        { "command": "pushGo.openDiffFile", "group": "2_nav" },
+        { "command": "pushGo.commitThisFile", "group": "3_commit" }
+      ]
+    },
     "configuration": {
       "title": "Push&Go",
       "properties": {

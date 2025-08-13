@@ -2,7 +2,7 @@
   "name": "push-and-go",
   "displayName": "Push&Go",
   "description": "WebStorm-like Git sidebar for fast Commit / Push / Commit+Push.",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "publisher": "Maorlevinshtein",
   "icon": "icon.png",
     "repository": {

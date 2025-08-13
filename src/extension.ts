@@ -581,30 +581,42 @@ function equalState(a, b){
   return true;
 }
 
-const makeRow = (item, inIgnored=false) => {
+const makeRow = (item, inIgnored = false) => {
   const el = document.createElement('div');
   el.className = 'row';
   el.innerHTML = \`
-    <input class="chk" type="checkbox" \${item.staged ? 'checked' : ''} data-path="\${item.path}" aria-label="stage-toggle" />
-    <div class="name" title="\${item.full}" data-action="openDiff" data-path="\${item.path}">\${item.path}</div>
+    <input class="chk" type="checkbox" \${item.staged ? 'checked' : ''}
+           data-path="\${item.path}" aria-label="stage-toggle" />
+    <div class="name" title="\${item.full}" data-action="openDiff"
+         data-path="\${item.path}">\${item.path}</div>
     <span class="badge">\${item.status}</span>
-    <button class="iconbtn" title="\${inIgnored ? 'Unignore' : 'Ignore'}" aria-label="\${inIgnored ? 'Unignore' : 'Ignore'}"
-      data-action="\${inIgnored ? 'unignore' : 'ignore'}" data-path="\${item.path}">
+
+    <button class="iconbtn" title="\${inIgnored ? 'Unignore' : 'Ignore'}"
+            aria-label="\${inIgnored ? 'Unignore' : 'Ignore'}"
+            data-action="\${inIgnored ? 'unignore' : 'ignore'}"
+            data-path="\${item.path}">
       <svg viewBox="0 0 24 24" aria-hidden="true">
-        <!-- eye-off icon -->
-        <path d="M3 3l18 18"/><path d="M10.58 10.58a2 2 0 1 0 2.84 2.84"/>
-        <path d="M9.88 4.24A10.94 10.94 0 0 1 12 4c5 0 9 4 10 6- .3.6-1.21 2.08-2.93 3.58"/>
+        <path d="M12 3 21 12 12 21 3 12Z"></path>
+        <path d="M8.2 8.2 12 12 15.8 8.2"></path>
+        <path d="M12 7V4"></path>
+        <path d="M10.8 5.2 12 4l1.2 1.2"></path>
+        <circle cx="8.2" cy="8.2" r="1.4" fill="currentColor" stroke="none"></circle>
+        <circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none"></circle>
+        <circle cx="15.8" cy="8.2" r="1.4" fill="currentColor" stroke="none"></circle>
       </svg>
     </button>
-    <button class="iconbtn" title="Discard changes" aria-label="Discard" data-action="discard" data-path="\${item.path}">
+
+    <button class="iconbtn" title="Discard changes" aria-label="Discard"
+            data-action="discard" data-path="\${item.path}">
       <svg viewBox="0 0 24 24" aria-hidden="true">
-        <path d="M4 7h16M9 7v-2a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2M7 7l1 12a2 2 0 0 0 2 2h4a2 2 0 0 0 2-2l1-12"/>
-        <path d="M10 11v6M14 11v6"/>
+        <path d="M4 7h16M9 7v-2a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2M7 7l1 12a2 2 0 0 0 2 2h4a2 2 0 0 0 2-2l1-12"></path>
+        <path d="M10 11v6M14 11v6"></path>
       </svg>
     </button>
   \`;
   return el;
 };
+
 
 /* remove duplicates (prefer staged), then apply overlay so item stays visible where user put it */
 function applyOverlay(s){

@@ -44,13 +44,17 @@ It’s like having **Git on turbo mode** right inside your editor.
 
 ## Screenshots
 
-*(Replace with actual screenshots from your project once you have them)*
+![Push & Go files section](https://raw.githubusercontent.com/Maorlv52/Push-Go/dev/media/files_section.png)  
+*Files list with status badges — Quickly see all modified, staged, and ignored files in one clean view.*
 
-![Push & Go Panel](https://raw.githubusercontent.com/Maorlevinshtein/push-and-go/main/media/panel.png)  
-*Manage changes at a glance*
+![Push & Go files section](https://raw.githubusercontent.com/Maorlv52/Push-Go/dev/media/lower_section.png)  
+*Action controls — Stage, unstage, ignore/unignore, or discard changes with intuitive icon buttons.*
 
-![Icons](https://raw.githubusercontent.com/Maorlevinshtein/push-and-go/main/media/icons.png)  
-*Modern, minimal action icons*
+![Push & Go files section](https://raw.githubusercontent.com/Maorlv52/Push-Go/dev/media/command_pallete.png)  
+*Command Palette integration — Access Push & Go commands instantly without leaving your keyboard.*
+
+![Push & Go files section](https://raw.githubusercontent.com/Maorlv52/Push-Go/dev/media/full_view.png)  
+*Full extension workflow — Stage changes, commit, push, and manage files all in one streamlined panel.*
 
 ---
 

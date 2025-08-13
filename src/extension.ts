@@ -5,6 +5,7 @@ import * as path from 'path';
 
 /* =============== Git bootstrap =============== */
 
+
 let gitApi: any | undefined;
 let ctxGlobal: vscode.ExtensionContext | undefined;
 

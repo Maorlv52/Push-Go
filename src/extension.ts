@@ -358,6 +358,7 @@ class PushGoViewProvider implements vscode.WebviewViewProvider {
       setTimeout(() => void pushStateNow(), 0);
     })();
   }
+  
 }
 
 /* =============== Webview (compact UI) =============== */

@@ -2,16 +2,21 @@
   "name": "push-and-go",
   "displayName": "Push&Go",
   "description": "WebStorm-like Git sidebar for fast Commit / Push / Commit+Push.",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "publisher": "Maorlevinshtein",
   "icon": "icon.png",
-    "repository": {
+  "repository": {
     "type": "git",
     "url": "https://github.com/maorlevinshtein/Push-Go.git"
   },
   "license": "MIT",
-  "engines": { "vscode": "^1.102.0" },
-  "categories": ["SCM Providers", "Other"],
+  "engines": {
+    "vscode": "^1.102.0"
+  },
+  "categories": [
+    "SCM Providers",
+    "Other"
+  ],
   "main": "./dist/extension.js",
   "activationEvents": [
     "onView:pushGo.sidebar",
@@ -30,27 +35,62 @@
   "contributes": {
     "viewsContainers": {
       "activitybar": [
-        { "id": "pushGo", "title": "Push&Go", "icon": "media/pushgo.svg" }
+        {
+          "id": "pushGo",
+          "title": "Push&Go",
+          "icon": "media/pushgo.svg"
+        }
       ]
     },
     "views": {
       "pushGo": [
-        { "type": "webview", "id": "pushGo.sidebar", "name": "Push&Go", "icon": "media/pushgo.svg" }
+        {
+          "type": "webview",
+          "id": "pushGo.sidebar",
+          "name": "Push&Go",
+          "icon": "media/pushgo.svg"
+        }
       ]
     },
     "commands": [
-      { "command": "pushGo.open", "title": "Push&Go: Focus" },
-      { "command": "pushGo.commit", "title": "Push&Go: Commit" },
-      { "command": "pushGo.commitPush", "title": "Push&Go: Commit + Push" },
-
-      { "command": "pushGo.stageFile", "title": "Push&Go: Stage" },
-      { "command": "pushGo.unstageFile", "title": "Push&Go: Unstage" },
-      { "command": "pushGo.discardFile", "title": "Push&Go: Discard" },
-      { "command": "pushGo.openDiffFile", "title": "Push&Go: Open Diff" },
-      { "command": "pushGo.commitThisFile", "title": "Push&Go: Commit This File(s)" }
+      {
+        "command": "pushGo.open",
+        "title": "Push&Go: Focus"
+      },
+      {
+        "command": "pushGo.commit",
+        "title": "Push&Go: Commit"
+      },
+      {
+        "command": "pushGo.commitPush",
+        "title": "Push&Go: Commit + Push"
+      },
+      {
+        "command": "pushGo.stageFile",
+        "title": "Push&Go: Stage"
+      },
+      {
+        "command": "pushGo.unstageFile",
+        "title": "Push&Go: Unstage"
+      },
+      {
+        "command": "pushGo.discardFile",
+        "title": "Push&Go: Discard"
+      },
+      {
+        "command": "pushGo.openDiffFile",
+        "title": "Push&Go: Open Diff"
+      },
+      {
+        "command": "pushGo.commitThisFile",
+        "title": "Push&Go: Commit This File(s)"
+      }
     ],
     "submenus": [
-      { "id": "pushGo.explorer", "label": "Push&Go" }
+      {
+        "id": "pushGo.explorer",
+        "label": "Push&Go"
+      }
     ],
     "menus": {
       "explorer/context": [
@@ -61,11 +101,26 @@
         }
       ],
       "pushGo.explorer": [
-        { "command": "pushGo.stageFile", "group": "1_mod" },
-        { "command": "pushGo.unstageFile", "group": "1_mod" },
-        { "command": "pushGo.discardFile", "group": "1_mod" },
-        { "command": "pushGo.openDiffFile", "group": "2_nav" },
-        { "command": "pushGo.commitThisFile", "group": "3_commit" }
+        {
+          "command": "pushGo.stageFile",
+          "group": "1_mod"
+        },
+        {
+          "command": "pushGo.unstageFile",
+          "group": "1_mod"
+        },
+        {
+          "command": "pushGo.discardFile",
+          "group": "1_mod"
+        },
+        {
+          "command": "pushGo.openDiffFile",
+          "group": "2_nav"
+        },
+        {
+          "command": "pushGo.commitThisFile",
+          "group": "3_commit"
+        }
       ]
     },
     "configuration": {
@@ -84,8 +139,18 @@
       }
     },
     "keybindings": [
-      { "command": "pushGo.commit", "key": "cmd+enter", "mac": "cmd+enter", "when": "view == pushGo.sidebar" },
-      { "command": "pushGo.commitPush", "key": "cmd+shift+enter", "mac": "cmd+shift+enter", "when": "view == pushGo.sidebar" }
+      {
+        "command": "pushGo.commit",
+        "key": "cmd+enter",
+        "mac": "cmd+enter",
+        "when": "view == pushGo.sidebar"
+      },
+      {
+        "command": "pushGo.commitPush",
+        "key": "cmd+shift+enter",
+        "mac": "cmd+shift+enter",
+        "when": "view == pushGo.sidebar"
+      }
     ]
   },
   "scripts": {

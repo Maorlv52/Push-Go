@@ -2,7 +2,7 @@
   "name": "push-and-go",
   "displayName": "Push&Go",
   "description": "WebStorm-like Git sidebar for fast Commit / Push / Commit+Push.",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "publisher": "Maorlevinshtein",
   "icon": "icon.png",
   "repository": {
@@ -11,7 +11,7 @@
   },
   "license": "MIT",
   "engines": {
-    "vscode": "^1.102.0"
+    "vscode": "^1.74.0"
   },
   "categories": [
     "SCM Providers",

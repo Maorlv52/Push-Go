@@ -165,11 +165,12 @@ async function pickOrCreateRemote(cwd: string): Promise<string | undefined> {
   if (pick.label.startsWith('+')) {
     const defaultName = remotes.includes('origin') ? '' : 'origin';
     const name = await vscode.window.showInputBox({
-      prompt: 'Remote name',
+      prompt: 'New tag name',
       value: defaultName,
-      validateInput: v => v.trim() ? undefined : 'Required',
+      validateInput: v => v.trim() ? (/\s/.test(v) ? 'No spaces in tag name' : undefined) : 'Required',
       ignoreFocusOut: true,
     });
+    
     if (!name) return;
 
     const url = await vscode.window.showInputBox({
@@ -277,6 +278,9 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('pushGo.discardFile', (uri?: vscode.Uri, uris?: vscode.Uri[]) => discardFromExplorer(uri, uris)),
     vscode.commands.registerCommand('pushGo.openDiffFile', (uri?: vscode.Uri) => openDiffFromExplorer(uri)),
     vscode.commands.registerCommand('pushGo.commitThisFile', (uri?: vscode.Uri, uris?: vscode.Uri[]) => commitThisFromExplorer(uri, uris)),
+    vscode.commands.registerCommand('pushGo.createTag', () => createTagFromPalette()),
+    vscode.commands.registerCommand('pushGo.pushTag', () => pushTagFromPalette()),
+    vscode.commands.registerCommand('pushGo.createAndPushTag', () => createAndPushTagFromPalette()),
   );
   void ensureGitAvailable();
 }
@@ -358,7 +362,7 @@ class PushGoViewProvider implements vscode.WebviewViewProvider {
       setTimeout(() => void pushStateNow(), 0);
     })();
   }
-  
+
 }
 
 /* =============== Webview (compact UI) =============== */
@@ -1205,6 +1209,117 @@ async function openDiffFromExplorer(uri?: vscode.Uri) {
   await vscode.commands.executeCommand('vscode.diff', left, uri, rel(cwd, uri.fsPath));
 }
 
+/* ===== Tag helpers (command-palette only) ===== */
+const safeName = (s: string) => s.replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '');
+const pad = (n: number, len = 2) => String(n).padStart(len, '0');
+
+async function tagExists(cwd: string, name: string): Promise<boolean> {
+  try { await runGit(['rev-parse', '-q', '--verify', `refs/tags/${name}`], cwd); return true; }
+  catch { return false; }
+}
+
+async function newestLocalTag(cwd: string): Promise<string> {
+  const out = await runGit(['tag', '--sort=-creatordate'], cwd).catch(() => '');
+  const tags = out.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+  return tags[0] ?? '';
+}
+
+async function buildDefaultTagName(cwd: string): Promise<string> {
+  const d = new Date();
+  const ts = `${pad(d.getDate())}.${pad(d.getMonth() + 1)}.${d.getFullYear()}.${pad(d.getHours())}${pad(d.getMinutes())}`;
+  const branch = safeName((await getBranch(cwd)) || 'HEAD');
+  // trailing "_" so you can quickly add a suffix like "team2_stage_update"
+  return `grow_${ts}_${branch}_`;
+}
+
+/* Create a tag (lightweight if no message, annotated if message provided) */
+async function createTagFromPalette(): Promise<void> {
+  const ctx = await withRepo(); if (!ctx) return;
+  const { repo } = ctx; const cwd = repo.rootUri.fsPath;
+  if (!(await hasHead(cwd))) {
+    vscode.window.showInformationMessage('Push&Go: No commits yet to tag.');
+    return;
+  }
+
+  const name = await vscode.window.showInputBox({
+    prompt: 'New tag name',
+    validateInput: v => v.trim()
+      ? (/\s/.test(v) ? 'No spaces in tag name' : undefined)
+      : 'Required',
+    ignoreFocusOut: true,
+  });
+  if (!name) return;
+
+  // check if tag already exists
+  const exists = await runGit(['rev-parse', '-q', '--verify', `refs/tags/${name}`], cwd)
+    .then(() => true)
+    .catch(() => false);
+  if (exists) {
+    vscode.window.showErrorMessage(`Push&Go: Tag "${name}" already exists.`);
+    return;
+  }
+
+  const msg = await vscode.window.showInputBox({
+    prompt: 'Tag annotation message (optional). Leave empty for lightweight tag.',
+    ignoreFocusOut: true,
+  });
+
+  await vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title: `Push&Go: Creating tag ${name}…` },
+    async () => {
+      const annotated = !!msg?.trim();
+      const args = annotated ? ['tag', '-a', name, '-m', msg!.trim()] : ['tag', name];
+      await runGit(args, cwd);
+    }
+  );
+
+  vscode.window.showInformationMessage(`Push&Go: Created tag ${name}.`);
+}
+
+
+/* Push a tag to a sensible remote */
+async function pushTagFromPalette(): Promise<void> {
+  const ctx = await withRepo(); if (!ctx) return;
+  const { repo } = ctx; const cwd = repo.rootUri.fsPath;
+
+  const tag = await vscode.window.showInputBox({
+    prompt: 'Tag to push',
+    validateInput: v => v.trim() ? undefined : 'Required',
+    ignoreFocusOut: true,
+  });
+  if (!tag) return;
+
+  const exists = await runGit(['rev-parse', '-q', '--verify', `refs/tags/${tag}`], cwd)
+    .then(() => true)
+    .catch(() => false);
+  if (!exists) {
+    vscode.window.showErrorMessage(`Push&Go: Tag "${tag}" does not exist locally.`);
+    return;
+  }
+
+  // Resolve remote (may be undefined until we pick/create)
+  const upstream = await getUpstream(cwd);
+  const remotes = upstream?.remote ? [upstream.remote] : await listRemotes(cwd);
+
+  let remote: string | undefined =
+    remotes.includes('origin') ? 'origin' : remotes[0];
+
+  if (!remote) remote = await pickOrCreateRemote(cwd);
+  if (!remote) {
+    vscode.window.showInformationMessage('Push&Go: Push canceled.');
+    return;
+  }
+
+  await vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title: `Push&Go: Pushing tag ${tag}…` },
+    async () => { await runGit(['push', remote!, tag], cwd); }
+  );
+
+  vscode.window.showInformationMessage(`Push&Go: Pushed tag ${tag} → ${remote}.`);
+}
+
+
+
 async function commitThisFromExplorer(uri?: vscode.Uri, uris?: vscode.Uri[]) {
   await runBatch(async () => {
     const ctx = await withRepo(); if (!ctx) return;
@@ -1259,4 +1374,74 @@ async function commitThisFromExplorer(uri?: vscode.Uri, uris?: vscode.Uri[]) {
     postToViewGlobal?.({ type: 'clearMsg' });
     vscode.window.showInformationMessage(`Push&Go: Committed ${finalStaged.length} file(s).`);
   });
+}
+
+async function createAndPushTagFromPalette(): Promise<void> {
+  const ctx = await withRepo(); if (!ctx) return;
+  const { repo } = ctx; const cwd = repo.rootUri.fsPath;
+
+  if (!(await hasHead(cwd))) {
+    vscode.window.showInformationMessage('Push&Go: No commits yet to tag.');
+    return;
+  }
+
+  const name = await vscode.window.showInputBox({
+    prompt: 'New tag name',
+    validateInput: v => v.trim()
+      ? (/\s/.test(v) ? 'No spaces in tag name' : undefined)
+      : 'Required',
+    ignoreFocusOut: true,
+  });
+  if (!name) return;
+
+  // refuse if tag already exists locally
+  const exists = await runGit(['rev-parse', '-q', '--verify', `refs/tags/${name}`], cwd)
+    .then(() => true)
+    .catch(() => false);
+  if (exists) {
+    vscode.window.showErrorMessage(`Push&Go: Tag "${name}" already exists.`);
+    return;
+  }
+
+  const msg = await vscode.window.showInputBox({
+    prompt: 'Tag annotation message (optional). Leave empty for lightweight tag.',
+    ignoreFocusOut: true,
+  });
+  const annotated = !!msg?.trim();
+
+  // Resolve remote (prefer upstream → origin → first → ask)
+  const upstream = await getUpstream(cwd);
+  const remotes = upstream?.remote ? [upstream.remote] : await listRemotes(cwd);
+  let remote: string | undefined = remotes.includes('origin') ? 'origin' : remotes[0];
+  if (!remote) remote = await pickOrCreateRemote(cwd);
+  if (!remote) { vscode.window.showInformationMessage('Push&Go: Push canceled.'); return; }
+
+  // Branch & SHA (API first, then CLI)
+  const branch = repo.state?.HEAD?.name || (await getBranch(cwd)) || 'detached HEAD';
+  const sha = await runGit(['rev-parse', '--short', 'HEAD'], cwd).catch(() => '');
+
+  // ✅ Friendly, informative confirm
+  const summaryLine = `Pushing tag "${name}" from ${branch} to "${remote}".`;
+  const details = [
+    `• Type: ${annotated ? 'Annotated' : 'Lightweight'}`,
+    `• Commit: ${sha || 'HEAD'}`
+  ].join('\n');
+
+  const confirm = await vscode.window.showWarningMessage(
+    `${summaryLine}\n\n${details}\n\nCreate & push now?`,
+    { modal: true },
+    'Create & Push'
+  );
+  if (confirm !== 'Create & Push') return;
+
+  await vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title: `Push&Go: Creating & pushing tag ${name}…` },
+    async () => {
+      const args = annotated ? ['tag', '-a', name, '-m', msg!.trim()] : ['tag', name];
+      await runGit(args, cwd);
+      await runGit(['push', remote!, name], cwd);
+    }
+  );
+
+  vscode.window.showInformationMessage(`Push&Go: Created & pushed tag ${name} → ${remote}.`);
 }

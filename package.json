@@ -2,7 +2,7 @@
   "name": "push-and-go",
   "displayName": "Push&Go",
   "description": "WebStorm-like Git sidebar for fast Commit / Push / Commit+Push.",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "publisher": "Maorlevinshtein",
   "icon": "icon.png",
   "repository": {
@@ -27,7 +27,10 @@
     "onCommand:pushGo.unstageFile",
     "onCommand:pushGo.discardFile",
     "onCommand:pushGo.openDiffFile",
-    "onCommand:pushGo.commitThisFile"
+    "onCommand:pushGo.commitThisFile",
+    "onCommand:pushGo.createTag",
+    "onCommand:pushGo.pushTag",
+    "onCommand:pushGo.createAndPushTag"
   ],
   "extensionDependencies": [
     "vscode.git"
@@ -84,6 +87,21 @@
       {
         "command": "pushGo.commitThisFile",
         "title": "Push&Go: Commit This File(s)"
+      },
+      {
+        "command": "pushGo.createTag",
+        "title": "Create Tag",
+        "category": "Push&Go"
+      },
+      {
+        "command": "pushGo.pushTag",
+        "title": "Push Tag",
+        "category": "Push&Go"
+      },
+      {
+        "command": "pushGo.createAndPushTag",
+        "title": "Create & Push Tag",
+        "category": "Push&Go"
       }
     ],
     "submenus": [
@@ -159,6 +177,7 @@
     "package": "vsce package"
   },
   "devDependencies": {
+    "@types/node": "^20",
     "@types/vscode": "^1.102.0",
     "@vscode/vsce": "^3.6.0",
     "typescript": "^5.9.2"
